@@ -1,0 +1,8 @@
+{
+  "name": "YOUR NAME",
+  "subtitle": "A SHORT DESCRIPTION",
+  "nixieNumber": "20.260101",
+  "nameFont": "Didot",
+  "subtitleFont": "Baskerville-SemiBold",
+  "wallpaperVideo": "~/.config/wallpaper-overlay/wallpaper-stacked.mp4"
+}

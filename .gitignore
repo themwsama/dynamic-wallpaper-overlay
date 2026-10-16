@@ -1,0 +1,19 @@
+# Build output
+*.app/
+/wallpaper-overlay
+.build/
+
+# Personal media and runtime data: never commit these
+*.mp4
+*.mov
+*.gif
+*.png
+!docs/images/*.png
+config.json
+lyrics-cache/
+genre-cache.json
+*.log
+
+# Tool state
+.DS_Store
+.impeccable/
