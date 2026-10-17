@@ -147,7 +147,7 @@ All of these sit **behind** normal app windows, like a real wallpaper:
 | **Clock card** | Glass stopwatch / countdown timer under the name; it slides out of the way when the control center opens |
 | **Music glow** | While Spotify plays: a soft glow along the bottom edge that pulses with the real beat, colored by the song's genre, with fire sparks launched on the beat at the song's tempo |
 | **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese. Songs LRCLIB has only as plain text show with estimated timing: no sweep, slightly dimmer, marked "♪ approximate". While lyrics load and during a song's intro the box shows the title and artist, small and dim; songs with no lyrics keep it empty |
-| **Efficiency** | ~200 MB memory while visible; pauses and releases all video memory when the screen sleeps or locks, or the desktop is fully covered. Each screen pauses on its own when covered. Idle rendering is capped at about 1.25× the video resolution; 30 fps cap in Low Power Mode |
+| **Efficiency** | ~150 MB memory while visible; pauses and releases all video memory when the screen sleeps or locks, or the desktop is fully covered. Each screen pauses on its own when covered. Idle rendering is capped at about 1.25× the video resolution; 30 fps cap in Low Power Mode |
 
 ---
 

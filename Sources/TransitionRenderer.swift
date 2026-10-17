@@ -73,8 +73,9 @@ let UNIFORMS_STRIDE = 160  // must equal Metal's sizeof(Uniforms); see Transitio
 let NIXIE_MAX_DIGITS = 12
 let NIXIE_POINT_INDEX = 10  // atlas cell after the digits 0-9
 // Drawable pixels per video pixel (aspect-fill). The video has no detail beyond
-// 1x, so idle frames render slightly above it and let the compositor scale
-let IDLE_DRAWABLE_SCALE_CAP: CGFloat = 1.25
+// 1x, so idle frames render at it and let the compositor scale. Core Animation
+// keeps about 4 surfaces per screen, so each 0.25 above 1x cost ~30 MB on Retina
+let IDLE_DRAWABLE_SCALE_CAP: CGFloat = 1.0
 
 // MTKView that tells its renderer when it needs resizing or when its own
 // window is covered, so each screen can pause on its own
