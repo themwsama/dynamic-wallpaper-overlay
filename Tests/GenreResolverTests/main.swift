@@ -436,6 +436,54 @@ do {
     check(resolveFull(makeResolver(url, noCreds), track("Somebody"))?.source == "itunes", "wrong cache version ignored")
 }
 
+// MARK: 13. lazy credentials (keychain) only on first network need, off main
+
+do {
+    final class Loader {
+        private let lock = NSLock()
+        private var _calls = 0
+        private var _offMain = true
+        var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+        var offMain: Bool { lock.lock(); defer { lock.unlock() }; return _offMain }
+        func load() -> GenreCredentials {
+            lock.lock(); _calls += 1; if Thread.isMainThread { _offMain = false }; lock.unlock()
+            return fullCreds
+        }
+    }
+    fixture.reset()
+    let loader = Loader()
+    let url = freshCacheURL()
+    let lazy = GenreResolver(cacheURL: url, session: stubSession, credentials: { loader.load() })
+    check(loader.calls == 0, "lazy credentials not read at init")
+    fixture.itunesResults = [itunesItem("Lazy", "Rock")]
+    let first = resolveFull(lazy, track("Lazy", id: "spotify:track:lazy1"))
+    check(first?.source == "itunes" && loader.calls == 0, "iTunes success path never reads credentials")
+    let hit = resolveFull(lazy, track("Lazy", id: "spotify:track:lazy1"))
+    check(hit?.source == "cache" && loader.calls == 0, "cache hit never reads credentials")
+
+    // iTunes has no answer: the Spotify step needs keys, so they load now, once, off main
+    fixture.itunesResults = []
+    fixture.spotifyGenres = ["techno"]
+    let viaSpotify = resolveFull(lazy, track("Lazy", id: "spotify:track:lazy2"))
+    check(viaSpotify?.bucket == .electronic && viaSpotify?.source == "spotify", "lazy credentials reach Spotify")
+    check(loader.calls == 1 && loader.offMain, "credentials loaded once, off the main thread")
+    fixture.spotifyGenres = []
+    fixture.geminiText = "\"classical\""
+    let viaGemini = resolveFull(lazy, track("Lazy", id: "spotify:track:lazy3"))
+    check(viaGemini?.source == "gemini" && loader.calls == 1, "later lookups reuse the loaded credentials")
+
+    // Two lookups needing keys at once share one load
+    fixture.reset()
+    fixture.spotifyGenres = ["jazz"]
+    let loader2 = Loader()
+    let r2 = GenreResolver(cacheURL: freshCacheURL(), session: stubSession, credentials: { loader2.load() })
+    var got: [GenreBucket] = []
+    r2.resolve(track("P", id: "spotify:track:p1")) { b, _ in got.append(b) }
+    r2.resolve(track("Q", id: "spotify:track:q1")) { b, _ in got.append(b) }
+    spin { got.count == 2 }
+    check(got == [.jazzSoul, .jazzSoul] && loader2.calls == 1, "concurrent lookups share one credentials load")
+}
+
 try? FileManager.default.removeItem(at: workDir)
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 if failures > 0 { exit(1) }

@@ -168,16 +168,26 @@ private struct GeminiResponse: Decodable {
 final class GenreResolver {
     private let cacheURL: URL
     private let session: URLSession
-    private let credentials: GenreCredentials
+    private let loadCredentials: () -> GenreCredentials
+    private var credentials: GenreCredentials?
+    private var credentialWaiters: [(GenreCredentials) -> Void]?  // non-nil while loading
     private var cache: [String: GenreBucket]
     private var waiters: [String: [(GenreBucket, String) -> Void]] = [:]
     private var failedAt: [String: Date] = [:]
     private var token: SpotifyToken?
 
-    init(cacheURL: URL, session: URLSession = .shared, credentials: GenreCredentials) {
+    convenience init(cacheURL: URL, session: URLSession = .shared, credentials: GenreCredentials) {
+        self.init(cacheURL: cacheURL, session: session, credentials: { credentials })
+        self.credentials = credentials
+    }
+
+    // Keychain reads can block (and may prompt), so `credentials` runs only when a
+    // lookup first needs a key, once, off the main thread. Cache hits and iTunes
+    // answers never touch it.
+    init(cacheURL: URL, session: URLSession = .shared, credentials: @escaping () -> GenreCredentials) {
         self.cacheURL = cacheURL
         self.session = session
-        self.credentials = credentials
+        self.loadCredentials = credentials
         self.cache = Self.loadCache(from: cacheURL)
     }
 
@@ -379,6 +389,11 @@ final class GenreResolver {
     // MARK: Spotify
 
     private func spotifyBucket(for track: TrackInfo, completion: @escaping (GenreBucket?) -> Void) {
+        withCredentials { [self] credentials in spotifyBucket(for: track, credentials, completion: completion) }
+    }
+
+    private func spotifyBucket(for track: TrackInfo, _ credentials: GenreCredentials,
+                               completion: @escaping (GenreBucket?) -> Void) {
         guard let clientID = credentials.spotifyClientID, !clientID.isEmpty,
               let secret = credentials.spotifyClientSecret, !secret.isEmpty,
               let trackID = Self.spotifyTrackID(from: track.trackID) else { return completion(nil) }
@@ -419,6 +434,11 @@ final class GenreResolver {
     // MARK: Gemini
 
     private func geminiBucket(for track: TrackInfo, completion: @escaping (GenreBucket?) -> Void) {
+        withCredentials { [self] credentials in geminiBucket(for: track, credentials, completion: completion) }
+    }
+
+    private func geminiBucket(for track: TrackInfo, _ credentials: GenreCredentials,
+                              completion: @escaping (GenreBucket?) -> Void) {
         guard let apiKey = credentials.geminiAPIKey, !apiKey.isEmpty,
               let url = URL(string: GEMINI_ENDPOINT),
               let body = try? JSONSerialization.data(withJSONObject: Self.geminiRequestBody(for: track))
@@ -429,6 +449,28 @@ final class GenreResolver {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
         send(request, label: "gemini", parse: Self.parseGeminiResponse, completion: completion)
+    }
+
+    // MARK: Credentials
+
+    // Loads once; lookups that need keys while the load runs wait for the same result
+    private func withCredentials(_ body: @escaping (GenreCredentials) -> Void) {
+        if let credentials { return body(credentials) }
+        if credentialWaiters != nil {
+            credentialWaiters?.append(body)
+            return
+        }
+        credentialWaiters = [body]
+        let load = loadCredentials
+        DispatchQueue.global(qos: .utility).async {
+            let loaded = load()
+            DispatchQueue.main.async { [self] in
+                credentials = loaded
+                let pending = credentialWaiters ?? []
+                credentialWaiters = nil
+                pending.forEach { $0(loaded) }
+            }
+        }
     }
 
     // MARK: Transport

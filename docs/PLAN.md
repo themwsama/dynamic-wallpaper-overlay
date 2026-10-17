@@ -14,10 +14,19 @@ third-party wallpaper app and no personal data from the original author.
 | 3. One-shot installer and uninstaller | Done: `install.sh`, `uninstall.sh`, `DRY_RUN=1` |
 | 4. Tests in the repo | Done: `Tests/*`, `scripts/run-tests.sh` |
 | 5. Agent and human docs | Done: `AGENTS.md`, `README.md`, this plan |
-| 6. GitHub repository | Pending the owner's go-ahead (name, visibility) |
+| 6. GitHub repository | Done: https://github.com/themwsama/dynamic-wallpaper-overlay |
 | 7. CI | Next |
 | 8. Signed releases | Later |
 | 9. Feature roadmap | Ongoing |
+
+Review fixes (done).
+
+Wave 3 is next:
+
+- Swift 6 strict concurrency.
+- A stable local signing identity.
+- A `NowPlayingSource` seam.
+- `Package.swift` with swift-testing.
 
 ## Phase 1: Extraction (done)
 
@@ -63,14 +72,16 @@ third-party wallpaper app and no personal data from the original author.
   troubleshooting.
 - `README.md`: human quick start.
 
-## Phase 6: GitHub repository (pending owner approval)
+## Phase 6: GitHub repository (done)
 
-1. Create the repo under the owner's account; visibility is the owner's choice.
-2. Push `main` with the initial commit.
+Published at https://github.com/themwsama/dynamic-wallpaper-overlay.
+
+1. Create the repo under the owner's account; visibility is the owner's choice. (Done)
+2. Push `main` with the initial commit. (Done)
 3. Add topics (`macos`, `wallpaper`, `metal`, `spotify`, `swift`) and a short
-   description.
+   description. (Open)
 4. Optionally add a demo GIF made from the **sample** wallpaper only, in
-   `docs/images/`.
+   `docs/images/`. (Open)
 
 ## Phase 7: CI (next)
 

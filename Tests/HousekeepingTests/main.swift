@@ -81,6 +81,13 @@ check("no zero gap", !d3.contains(0))
 check("new text at end", String(decoding: d3, as: UTF8.self).hasSuffix("z\nAFTER-TRIM\n"))
 check("size bounded after append", d3.count <= 1000 + more.utf8.count)
 
+// log path from the environment (WALLPAPER_OVERLAY_LOG)
+let defaultLog = NSHomeDirectory() + "/Library/Logs/wallpaper-overlay.log"
+check("log path default", resolveLogURL(env: [:]).path == defaultLog)
+check("log path empty env uses default", resolveLogURL(env: ["WALLPAPER_OVERLAY_LOG": ""]).path == defaultLog)
+check("log path absolute override", resolveLogURL(env: ["WALLPAPER_OVERLAY_LOG": "/var/tmp/x.log"]).path == "/var/tmp/x.log")
+check("log path tilde expanded", resolveLogURL(env: ["WALLPAPER_OVERLAY_LOG": "~/logs/x.log"]).path == NSHomeDirectory() + "/logs/x.log")
+
 try? fm.removeItem(at: root)
 if failed { print("FAILED"); exit(1) }
 print("ALL PASS")

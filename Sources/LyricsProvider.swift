@@ -11,9 +11,10 @@ let LYRICS_NEGATIVE_CACHE_TTL: TimeInterval = 7 * 24 * 3600
 // A search hit counts as the same recording when its length is this close
 let LYRICS_DURATION_TOLERANCE: TimeInterval = 3
 let LYRICS_LAST_LINE_FALLBACK_LENGTH: TimeInterval = 5
-// Bumped to 2 when get-without-synced started falling through to search; version 1
-// negative entries may be wrong and are ignored
-let LYRICS_CACHE_VERSION = 2
+// Bumped to 2 when get-without-synced started falling through to search; bumped to 3
+// when search results started being checked against the title and artist, since
+// earlier entries may hold another song's lyrics. Older entries are ignored.
+let LYRICS_CACHE_VERSION = 3
 // Waits before the 2nd and 3rd attempt of a request that failed transiently
 let LYRICS_RETRY_DELAYS: [TimeInterval] = [1.5, 4]
 let LYRICS_CACHE_NAME_MAX = 80
@@ -52,6 +53,7 @@ private struct LyricsCacheEntry: Codable {
 }
 
 private struct LRCLibTrack: Decodable {
+    let trackName: String?
     let artistName: String?
     let duration: Double?
     let instrumental: Bool?
@@ -163,10 +165,18 @@ final class LyricsProvider {
     private static func parseLine(_ line: Substring, offset: TimeInterval) -> [LyricLine] {
         var rest = line
         var stamps: [TimeInterval] = []
-        while rest.hasPrefix("["), let close = rest.firstIndex(of: "]") {
-            let content = rest[rest.index(after: rest.startIndex)..<close]
-            if let stamp = parseTimestamp(content) { stamps.append(stamp) }
-            rest = rest[rest.index(after: close)...]
+        // Some files put a space between stamps: "[00:12.00] [00:15.00] text"
+        while true {
+            let trimmed = rest.drop(while: { $0 == " " || $0 == "\t" })
+            guard trimmed.hasPrefix("["), let close = trimmed.firstIndex(of: "]") else { break }
+            let content = trimmed[trimmed.index(after: trimmed.startIndex)..<close]
+            guard let stamp = parseTimestamp(content) else {
+                // Tag lines like [ar:x] carry no stamps; a bracket after a stamp is lyric text
+                if stamps.isEmpty { rest = trimmed[trimmed.index(after: close)...]; continue }
+                break
+            }
+            stamps.append(stamp)
+            rest = trimmed[trimmed.index(after: close)...]
         }
         guard let first = stamps.first else { return [] }
         let body = parseBody(rest)
@@ -280,7 +290,7 @@ final class LyricsProvider {
         }
         request(url, label: "lyrics search") { [self] result in
             switch result {
-            case .ok(let data): finish(key, Self.outcome(fromSearch: data, artist: artist, duration: duration))
+            case .ok(let data): finish(key, Self.outcome(fromSearch: data, artist: artist, title: title, duration: duration))
             case .notFound: finish(key, .none)
             case .failed, .retryable: finish(key, .failed)
             }
@@ -299,22 +309,31 @@ final class LyricsProvider {
         return .found(lyrics)
     }
 
-    private static func outcome(fromSearch data: Data, artist: String, duration: TimeInterval?) -> LookupOutcome {
+    // A search hit is trusted only when it is the same song: the title must match after
+    // normalizing, and then either the artist matches too or the length is within
+    // tolerance (covers "A & B" vs "A", romanized vs native artist names). Nothing
+    // acceptable is a definitive .none; never fall back to whatever came first.
+    private static func outcome(fromSearch data: Data, artist: String, title: String,
+                                duration: TimeInterval?) -> LookupOutcome {
         guard let tracks = try? JSONDecoder().decode([LRCLibTrack].self, from: data) else {
             NSLog("wallpaper-overlay: lyrics search response was not understood")
             return .failed
         }
-        var synced = tracks.filter { $0.instrumental != true && !($0.syncedLyrics ?? "").isEmpty }
-        // Covers and other artists' songs are skipped, unless nothing matches at all
-        let wanted = artist.trimmingCharacters(in: .whitespaces).lowercased()
-        let sameArtist = synced.filter {
-            $0.artistName?.trimmingCharacters(in: .whitespaces).lowercased() == wanted
+        let wantedTitle = normalizedMatchKey(title)
+        let wantedArtist = normalizedMatchKey(artist)
+        guard !wantedTitle.isEmpty else { return .none }
+        let candidates = tracks.filter { track in
+            guard track.instrumental != true, !(track.syncedLyrics ?? "").isEmpty,
+                  normalizedMatchKey(track.trackName ?? "") == wantedTitle else { return false }
+            return isSameArtist(track, wantedArtist) || isCloseInLength(track, duration)
         }
-        if !sameArtist.isEmpty { synced = sameArtist }
-        var pick = synced.first
+        // Same-artist results beat length-only matches
+        let sameArtist = candidates.filter { isSameArtist($0, wantedArtist) }
+        let pool = sameArtist.isEmpty ? candidates : sameArtist
+        var pick = pool.first
         if let duration {
-            // Closest length wins, if within tolerance; otherwise the first synced result
-            let close = synced
+            // Closest length wins, if within tolerance; otherwise the first acceptable result
+            let close = pool
                 .compactMap { track in track.duration.map { (track, abs($0 - duration)) } }
                 .filter { $0.1 <= LYRICS_DURATION_TOLERANCE }
                 .min { $0.1 < $1.1 }
@@ -323,6 +342,41 @@ final class LyricsProvider {
         guard let pick, let lyrics = parseLRC(pick.syncedLyrics ?? "", duration: duration ?? pick.duration)
         else { return .none }
         return .found(lyrics)
+    }
+
+    private static func isSameArtist(_ track: LRCLibTrack, _ wanted: String) -> Bool {
+        !wanted.isEmpty && normalizedMatchKey(track.artistName ?? "") == wanted
+    }
+
+    private static func isCloseInLength(_ track: LRCLibTrack, _ duration: TimeInterval?) -> Bool {
+        guard let duration, let length = track.duration else { return false }
+        return abs(length - duration) <= LYRICS_DURATION_TOLERANCE
+    }
+
+    // Suffixes that name a release, not a different song: "- Remastered 2011", "- TV Size"
+    private static let releaseSuffix = try! NSRegularExpression(
+        pattern: #"\s+[-–—]\s+.*\b(remaster(ed)?|version|ver\.?|edit|mix|mono|stereo|size|feat\.?|ft\.?|deluxe|bonus|single|radio)\b.*$"#,
+        options: [.caseInsensitive])
+    private static let parenthetical = try! NSRegularExpression(pattern: #"[(\[（［][^)\]）］]*[)\]）］]"#)
+
+    // Lowercase letters and digits only. NFKC first so full-width and half-width forms
+    // (Ａ/A, ｶﾀｶﾅ/カタカナ) agree; then "(feat. X)", "[Live]" and "- Remastered" are dropped.
+    // If dropping them would leave nothing (a title that is only "(Intro)"), keep them.
+    static func normalizedMatchKey(_ text: String) -> String {
+        let folded = text.precomposedStringWithCompatibilityMapping
+        let stripped = removeMatches(releaseSuffix, in: removeMatches(parenthetical, in: folded))
+        let key = alphanumericKey(stripped)
+        return key.isEmpty ? alphanumericKey(folded) : key
+    }
+
+    private static func removeMatches(_ regex: NSRegularExpression, in text: String) -> String {
+        regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+    }
+
+    private static func alphanumericKey(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.lowercased().unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0)
+        }))
     }
 
     private func finish(_ key: String, _ outcome: LookupOutcome) {

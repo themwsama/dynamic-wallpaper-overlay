@@ -76,6 +76,15 @@ do {
     let l = LyricsProvider.parseLRC("[00:01.00] one\n[00:05.00]\n[00:09.00] two", duration: nil)!
     check(l.lines.count == 3 && l.lines[1].text == "" && l.lines[1].end == 9, "empty gap line kept")
 }
+do {
+    let l = LyricsProvider.parseLRC("[00:12.00] [00:15.00] spaced stamps\n[00:20.00]\t[00:25.00]\ttabbed", duration: nil)!
+    check(l.lines.count == 4 && l.lines.map(\.start) == [12, 15, 20, 25], "whitespace between stamps: one line per stamp")
+    check(l.lines.allSatisfy { $0.text == "spaced stamps" || $0.text == "tabbed" } && l.lines[0].text == "spaced stamps" && l.lines[2].text == "tabbed", "whitespace between stamps: text intact")
+    let m = LyricsProvider.parseLRC("[00:12.00] [00:15.00] text", duration: nil)!
+    check(m.lines.count == 2 && m.lines.allSatisfy { $0.text == "text" }, "two spaced stamps give 2 lines with text")
+    let b = LyricsProvider.parseLRC("[00:12.00] [Chorus] words", duration: nil)!
+    check(b.lines.count == 1 && b.lines[0].text == "[Chorus] words", "non-stamp bracket after a stamp stays in the text")
+}
 check(LyricsProvider.parseLRC("just some text\nno stamps\n[ar:x]", duration: 10) == nil, "garbage nil")
 check(LyricsProvider.parseLRC("", duration: nil) == nil, "empty nil")
 
@@ -120,9 +129,9 @@ do {
     resetStub { r in
         if r.url!.path.hasSuffix("/get") { return (404, Data()) }
         return (200, json([
-            ["duration": 250, "syncedLyrics": "[00:01.00] wrong length"],
-            ["duration": 201.5, "syncedLyrics": "[00:01.00] right length"],
-            ["duration": 200, "plainLyrics": "plain only"],
+            ["trackName": "River & Moon", "artistName": "Paper Lanterns", "duration": 250, "syncedLyrics": "[00:01.00] wrong length"],
+            ["trackName": "River & Moon", "artistName": "Paper Lanterns", "duration": 201.5, "syncedLyrics": "[00:01.00] right length"],
+            ["trackName": "River & Moon", "artistName": "Paper Lanterns", "duration": 200, "plainLyrics": "plain only"],
         ]))
     }
     let l = fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))
@@ -134,9 +143,9 @@ do {
 do {
     resetStub { r in
         if r.url!.path.hasSuffix("/get") { return (404, Data()) }
-        return (200, json([["duration": 999, "syncedLyrics": "[00:01.00] only candidate"]]))
+        return (200, json([["trackName": "River & Moon", "artistName": "Paper Lanterns", "duration": 999, "syncedLyrics": "[00:01.00] only candidate"]]))
     }
-    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))?.lines.first?.text == "only candidate", "search falls back to first synced")
+    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))?.lines.first?.text == "only candidate", "same song with a far duration still accepted via artist")
 }
 do {
     resetStub { _ in (200, json(["plainLyrics": "plain only", "instrumental": false])) }
@@ -197,7 +206,7 @@ func fetchArtist(_ p: LyricsProvider, artist: String, duration: TimeInterval?) -
 }
 do {
     resetStub { r in isGet(r) ? (200, json(["plainLyrics": "plain", "syncedLyrics": NSNull(), "instrumental": false]))
-        : (200, json([["artistName": "Paper Lanterns", "duration": 201, "syncedLyrics": "[00:01.00] from search"]])) }
+        : (200, json([["trackName": "River & Moon", "artistName": "Paper Lanterns", "duration": 201, "syncedLyrics": "[00:01.00] from search"]])) }
     check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))?.lines.first?.text == "from search", "get plain-only falls through to search")
     check(reqCount() == 2, "plain-only made get+search")
 }
@@ -209,20 +218,21 @@ do {
 }
 do {
     resetStub { r in isGet(r) ? (404, Data()) : (200, json([
-        ["artistName": "paper lanterns", "duration": 205, "syncedLyrics": "[00:01.00] far"],
-        ["artistName": "PAPER LANTERNS", "duration": 199, "syncedLyrics": "[00:01.00] closest"],
-        ["artistName": "paper lanterns", "duration": 202.5, "syncedLyrics": "[00:01.00] near"],
+        ["trackName": "River & Moon", "artistName": "paper lanterns", "duration": 205, "syncedLyrics": "[00:01.00] far"],
+        ["trackName": "river & moon", "artistName": "PAPER LANTERNS", "duration": 199, "syncedLyrics": "[00:01.00] closest"],
+        ["trackName": "River & Moon", "artistName": "paper lanterns", "duration": 202.5, "syncedLyrics": "[00:01.00] near"],
     ])) }
     check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), duration: 200)?.lines.first?.text == "closest", "search picks closest duration within 3s")
-    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), duration: nil)?.lines.first?.text == "far", "no duration: first synced")
+    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), duration: nil)?.lines.first?.text == "far", "no duration: first same-artist result")
 }
 do {
     resetStub { r in isGet(r) ? (404, Data()) : (200, json([
-        ["artistName": "Someone Else", "duration": 200, "syncedLyrics": "[00:01.00] cover"],
-        ["artistName": "Paper Lanterns", "duration": 230, "syncedLyrics": "[00:01.00] mine"],
+        ["trackName": "t", "artistName": "Someone Else", "duration": 200, "syncedLyrics": "[00:01.00] cover"],
+        ["trackName": "t", "artistName": "Paper Lanterns", "duration": 230, "syncedLyrics": "[00:01.00] mine"],
     ])) }
-    check(fetchArtist(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), artist: "paper lanterns", duration: 200)?.lines.first?.text == "mine", "artist mismatch skipped")
-    check(fetchArtist(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), artist: "Nobody Matches", duration: 200)?.lines.first?.text == "cover", "no artist match: keep all")
+    check(fetchArtist(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), artist: "paper lanterns", duration: 200)?.lines.first?.text == "mine", "same artist beats a length-only match")
+    check(fetchArtist(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), artist: "Nobody Matches", duration: 200)?.lines.first?.text == "cover", "no artist match: length-only match accepted")
+    check(fetchArtist(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), artist: "Nobody Matches", duration: 100) == nil, "no artist match and wrong length: rejected")
 }
 do {
     var n = 0
@@ -265,6 +275,59 @@ do {
     resetStub { r in isGet(r) ? (200, json(["plainLyrics": "p"])) : (200, json([[String: Any]]())) }
     let dir = tmpDir()
     check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && cacheFiles(dir).count == 1, "definitive miss writes negative")
+}
+
+
+// MARK: search result validation
+func searchResult(title: String = "River & Moon", artist: String = "Paper Lanterns", wantTitle: String = "River & Moon",
+                  wantArtist: String = "Paper Lanterns", duration: TimeInterval? = 200, results: [[String: Any]],
+                  dir: URL = tmpDir(), id: String = "sv") -> LookupOutcome? {
+    resetStub { r in isGet(r) ? (404, Data()) : (200, json(results)) }
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])
+    var out: LookupOutcome?
+    p.lyrics(trackID: id, artist: wantArtist, title: wantTitle, album: "al", duration: duration) { out = $0 }
+    spin { out != nil }
+    return out
+}
+func isNone(_ o: LookupOutcome?) -> Bool { if case .none? = o { return true }; return false }
+func text(_ o: LookupOutcome?) -> String? { lyricsOf(o ?? .failed)?.lines.first?.text }
+func hit(_ name: String, _ artist: String, _ duration: Double, _ lyric: String) -> [String: Any] {
+    ["trackName": name, "artistName": artist, "duration": duration, "syncedLyrics": "[00:01.00] \(lyric)"]
+}
+do {
+    check(isNone(searchResult(results: [hit("Different Song", "Paper Lanterns", 200, "wrong song")])), "wrong-title result rejected")
+    check(isNone(searchResult(results: [["artistName": "Paper Lanterns", "duration": 200, "syncedLyrics": "[00:01.00] no title"]])), "result without a title rejected")
+    check(text(searchResult(results: [hit("River & Moon (feat. Someone Invented)", "Paper Lanterns", 200, "feat ok")])) == "feat ok", "(feat. ...) suffix tolerated")
+    check(text(searchResult(results: [hit("River & Moon - Remastered 2011", "Paper Lanterns", 200, "remaster ok")])) == "remaster ok", "- Remastered suffix tolerated")
+    check(text(searchResult(results: [hit("River & Moon (TV Size)", "Paper Lanterns", 200, "tv ok")])) == "tv ok", "(TV Size) tolerated")
+    check(text(searchResult(wantTitle: "River & Moon - 2011 Remaster", results: [hit("River & Moon", "Paper Lanterns", 200, "wanted side")])) == "wanted side", "suffix on the Spotify side tolerated")
+    check(isNone(searchResult(results: [hit("River & Moon - Part Two", "Paper Lanterns", 200, "subtitle differs")])), "a real subtitle still differs")
+    check(text(searchResult(wantTitle: "Ｒｉｖｅｒ Ｍｏｏｎ", results: [hit("River Moon", "Paper Lanterns", 200, "width ok")])) == "width ok", "full-width Latin title matches")
+    check(text(searchResult(wantTitle: "ｶﾞｯｸﾞﾗﾝﾀﾝ", wantArtist: "ﾍﾟｰﾊﾟｰ", results: [hit("ガッグランタン", "ペーパー", 200, "kana ok")])) == "kana ok", "half-width katakana title and artist match")
+    check(text(searchResult(wantTitle: "紙の灯り", wantArtist: "灯", results: [hit("紙の灯り", "灯", 199, "kanji ok")])) == "kanji ok", "Japanese exact match")
+    check(text(searchResult(results: [hit("River & Moon", "Someone Else Entirely", 201, "length ok")])) == "length ok", "artist mismatch with matching duration accepted")
+    check(isNone(searchResult(results: [hit("River & Moon", "Someone Else Entirely", 240, "far")])), "artist mismatch with wrong duration rejected")
+    check(isNone(searchResult(duration: nil, results: [hit("River & Moon", "Someone Else Entirely", 200, "no length known")])), "artist mismatch and no duration rejected")
+    check(text(searchResult(duration: nil, results: [hit("River & Moon", "paper  lanterns", 200, "artist only")])) == "artist only", "artist match needs no duration (case and spacing folded)")
+    check(isNone(searchResult(results: [hit("Other One", "Paper Lanterns", 200, "x"), hit("Another", "Nobody", 200, "y")])), "nothing matching gives none")
+    check(isNone(searchResult(results: [])), "empty results give none")
+    check(text(searchResult(results: [hit("Other One", "Paper Lanterns", 200, "x"), hit("River & Moon", "Paper Lanterns", 200, "right")])) == "right", "right song picked among wrong ones")
+    check(text(searchResult(results: [hit("River & Moon", "Cover Band", 200, "cover"), hit("River & Moon", "Paper Lanterns", 230, "original")])) == "original", "artist match beats a length-only match")
+    let dir = tmpDir()
+    check(isNone(searchResult(results: [hit("Other One", "Paper Lanterns", 200, "x")], dir: dir)) && cacheFiles(dir).count == 1, "rejected search is a definitive miss, cached negative")
+    check(LyricsProvider.normalizedMatchKey("(Intro)") == "intro", "title that is only a parenthetical keeps its text")
+    check(LyricsProvider.normalizedMatchKey("  Hello, World! ") == "helloworld", "punctuation and whitespace dropped")
+}
+do {
+    // wrongly cached version-2 entry is dropped
+    let dir = tmpDir()
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let wrong = ["version": 2, "fetchedAt": Date().timeIntervalSince1970,
+                 "lyrics": ["lines": [["start": 1, "end": 5, "text": "wrong song"]]]] as [String: Any]
+    try! json(wrong).write(to: dir.appendingPathComponent(LyricsProvider.cacheFileName(for: "t1")))
+    resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
+    let l = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
+    check(LYRICS_CACHE_VERSION == 3 && l?.lines.first?.text == "paper lanterns drift over the river" && reqCount() == 1, "version 2 cache entry dropped")
 }
 
 // MARK: romaji

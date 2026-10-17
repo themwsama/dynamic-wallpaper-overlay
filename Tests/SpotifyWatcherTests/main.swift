@@ -70,6 +70,45 @@ check("onPositionUpdate each notification, track change once", positions == [3.0
 pw.handle(["Player State": "Paused", "Track ID": "spotify:track:p"])
 check("no position key keeps last", pw.lastPosition?.seconds == 9.0 && positions.count == 2)
 
+// Callback order: track, then position, then state
+let ow = SpotifyWatcher()
+var order: [String] = []
+var seenInTrackCallback: (Bool, Double?)?
+ow.onTrackChange = { _ in order.append("track"); seenInTrackCallback = (ow.isPlaying, ow.lastPosition?.seconds) }
+ow.onPositionUpdate = { _ in order.append("position") }
+ow.onStateChange = { _ in order.append("state") }
+ow.handle(["Player State": "Playing", "Track ID": "spotify:track:o1", "Playback Position": 4.0])
+check("callback order track, position, state", order == ["track", "position", "state"])
+check("fields are final before the first callback", seenInTrackCallback?.0 == true && seenInTrackCallback?.1 == 4.0)
+order = []
+ow.handle(["Player State": "Paused", "Track ID": "spotify:track:o1", "Playback Position": 5.0])
+check("position then state without a track change", order == ["position", "state"])
+order = []
+ow.handle(["Player State": "Paused", "Track ID": "spotify:track:o1"])
+check("no callbacks when nothing changed", order.isEmpty)
+
+// reset(): clears everything and reports the stop once
+let rw = SpotifyWatcher()
+var rStates: [Bool] = []
+rw.onStateChange = { rStates.append($0) }
+rw.handle(["Player State": "Playing", "Track ID": "spotify:track:r1", "Playback Position": 2.0])
+rStates = []
+rw.reset()
+check("reset clears track, position and play state", rw.track == nil && rw.lastPosition == nil && !rw.isPlaying)
+check("reset fires onStateChange(false) when it was playing", rStates == [false])
+rw.reset()
+check("reset when already stopped fires nothing", rStates == [false])
+let pausedW = SpotifyWatcher()
+var pausedStates: [Bool] = []
+pausedW.onStateChange = { pausedStates.append($0) }
+pausedW.handle(["Player State": "Paused", "Track ID": "spotify:track:r2"])
+pausedW.reset()
+check("reset while paused clears the track without a state callback", pausedW.track == nil && pausedStates.isEmpty)
+var replayed = 0
+rw.onTrackChange = { _ in replayed += 1 }
+rw.handle(["Player State": "Playing", "Track ID": "spotify:track:r1"])
+check("same track after reset counts as a new track", replayed == 1)
+
 w.start(); w.stop()
 check("start/stop do not crash", true)
 

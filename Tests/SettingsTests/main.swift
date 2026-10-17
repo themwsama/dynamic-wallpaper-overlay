@@ -19,7 +19,7 @@ var s = Settings(defaults: d)
 
 check("default clock", s.isClockVisible == true)
 check("default effects", s.isEffectsVisible == true)
-check("default style", s.transitionStyleRaw == 1)
+check("default style", s.transitionStyleRaw == DEFAULT_TRANSITION_STYLE_RAW && DEFAULT_TRANSITION_STYLE_RAW == 1)
 check("default glow", s.isMusicGlowEnabled == true)
 check("default lyrics", s.isLyricsEnabled == true)
 check("default romaji", s.isRomajiEnabled == false)

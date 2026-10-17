@@ -50,3 +50,31 @@ for target in [90, 120, 128, 174] as [Float] {
 }
 check(tempo(50) > 95 && tempo(50) < 105, "50 BPM folds into range as ~100")
 check(q.levels.bpm == 0, "no tempo from noise alone")
+
+// Tempo must not carry over a long gap: one analyzer, song A, silence, song B
+func feed(_ a: AudioAnalyzer, _ samples: [Float], from start: Double) -> Double {
+    samples.withUnsafeBufferPointer { buf in
+        var f = 0
+        while f * 2 < buf.count {
+            let end = min(buf.count, (f + block) * 2)
+            a.process(UnsafeBufferPointer(rebasing: buf[(f * 2)..<end]), channels: 2, at: start + Double(f) / Double(sr))
+            f += block
+        }
+    }
+    return start + Double(samples.count / 2) / Double(sr)
+}
+let gapAnalyzer = AudioAnalyzer(sampleRate: sr)
+var clock = feed(gapAnalyzer, render(seconds: 10, bpm: 120, kick: true, gain: 1), from: 0)
+check(abs(gapAnalyzer.levels.bpm - 120) < 3, "song A tempo measured before the gap")
+clock = feed(gapAnalyzer, [Float](repeating: 0, count: Int(sr) * 2), from: clock)
+check(abs(gapAnalyzer.levels.bpm - 120) < 3, "a 1 s silence keeps the tempo")
+clock = feed(gapAnalyzer, [Float](repeating: 0, count: Int(sr) * 2 * 2), from: clock)
+check(gapAnalyzer.levels.bpm == 0, "silence longer than TEMPO_MAX_GAP resets bpm to 0")
+let noBeats = AudioAnalyzer(sampleRate: sr)
+var t2 = feed(noBeats, render(seconds: 10, bpm: 90, kick: true, gain: 1), from: 0)
+t2 = feed(noBeats, render(seconds: 3, bpm: 90, kick: false, gain: 1), from: t2)
+check(noBeats.levels.bpm == 0 && noBeats.levels.lastSound > t2 - 1, "beatless (but audible) gap also resets bpm")
+clock = feed(gapAnalyzer, render(seconds: 1.2, bpm: 90, kick: true, gain: 1), from: clock)
+check(gapAnalyzer.levels.bpm == 0, "song B shows no tempo until it has enough beats of its own")
+clock = feed(gapAnalyzer, render(seconds: 8, bpm: 90, kick: true, gain: 1), from: clock)
+check(abs(gapAnalyzer.levels.bpm - 90) < 3, "song B tempo measured fresh (\(String(format: "%.1f", gapAnalyzer.levels.bpm)))")

@@ -24,7 +24,7 @@ and ffmpeg (`brew install ffmpeg`). Spotify desktop is optional.
 ## Install
 
 ```sh
-git clone <this repo> && cd dynamic-wallpaper-overlay
+git clone https://github.com/themwsama/dynamic-wallpaper-overlay && cd dynamic-wallpaper-overlay
 
 # Use your own video...
 scripts/install.sh --name "YOUR NAME" --subtitle "WHAT YOU DO" --video ~/Movies/loop.mp4 --set-desktop
@@ -32,12 +32,25 @@ scripts/install.sh --name "YOUR NAME" --subtitle "WHAT YOU DO" --video ~/Movies/
 scripts/install.sh --name "YOUR NAME" --subtitle "WHAT YOU DO" --sample
 ```
 
-Add `DRY_RUN=1` in front to preview. macOS will ask for:
+Add `DRY_RUN=1` in front to preview.
+
+**What to expect:** the first install takes 2-3 minutes at high CPU while it
+encodes the wallpaper. The encoded wallpaper is about 25 MB. The app build takes
+about 15 seconds. The app has no Dock icon; it runs in the background.
+
+macOS will ask for:
 
 - **System Audio Recording Only:** lets the glow follow the beat. Only Spotify
   is listened to, and nothing is recorded.
 - **Control Spotify:** reads the current song and its position, so lyrics stay
   in sync.
+
+### Check it's running
+
+```sh
+launchctl print gui/$(id -u)/local.wallpaper-overlay | grep state
+tail ~/Library/Logs/wallpaper-overlay.log
+```
 
 ### Using an AI agent?
 
@@ -59,11 +72,22 @@ Then restart with `launchctl kickstart -k gui/$(id -u)/local.wallpaper-overlay`.
 scripts/uninstall.sh            # add --keep-config to keep your config and wallpaper
 ```
 
+Other flags: `--yes` skips the confirmation, and `--reset-desktop` resets the
+desktop picture if it is the overlay's still frame. Uninstall also removes the
+app's preferences file.
+
 ## Privacy
 
-Audio never leaves your Mac. Song title, artist and album are sent to the
-iTunes Search API (genre) and LRCLIB (lyrics), and to Spotify or Gemini only if
-you add those API keys. Keys live in your Keychain.
+Audio never leaves your Mac. What leaves it, and where:
+
+- **iTunes Search** (genre): artist and title.
+- **LRCLIB** (lyrics): artist, title, album and duration, plus a User-Agent header.
+- **Spotify** (genre, only with keys): the track and artist IDs.
+- **Gemini** (genre, only with a key): artist, title and album.
+- **Every request** reveals your IP address to the service it goes to.
+
+Song names are written to the local log, which is trimmed automatically. Keys
+live in your Keychain.
 
 ## License
 

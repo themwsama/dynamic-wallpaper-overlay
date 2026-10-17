@@ -7,9 +7,18 @@ let LYRICS_CACHE_MAX_FILES = 400
 let LOG_MAX_BYTES = 2_000_000
 let LOG_KEEP_BYTES = 500_000
 
+let LOG_PATH_ENV = "WALLPAPER_OVERLAY_LOG"
+let DEFAULT_LOG_PATH = "~/Library/Logs/wallpaper-overlay.log"
+
+// Same path the LaunchAgent's StandardErrorPath points at (install.sh exports it)
+func resolveLogURL(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+    let raw = env[LOG_PATH_ENV].flatMap { $0.isEmpty ? nil : $0 } ?? DEFAULT_LOG_PATH
+    return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+}
+
 enum Housekeeping {
     static let cacheDirectory = OVERLAY_DIR.appendingPathComponent("lyrics-cache", isDirectory: true)
-    static let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/wallpaper-overlay.log")
+    static let logURL = resolveLogURL()
 
     // Returns the number of files deleted
     static func pruneCache(directory: URL, maxAge: TimeInterval, maxFiles: Int, now: Date = Date()) -> Int {

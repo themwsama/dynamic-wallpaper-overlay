@@ -70,21 +70,30 @@ final class SpotifyWatcher {
         return (track, isPlaying, position)
     }
 
+    // Callbacks fire as track change, then position, then state, so a listener
+    // that starts work on "playing" already knows the new track and where in it we are.
+    // All fields are updated first, so every callback sees the final state.
     func handle(_ userInfo: [AnyHashable: Any]) {
         let parsed = SpotifyWatcher.parse(userInfo)
         let previousID = track?.id
         track = parsed.track
-        if let seconds = parsed.position {
-            lastPosition = (seconds, CACurrentMediaTime())
-            onPositionUpdate?(seconds)
-        }
-        if isPlaying != parsed.isPlaying {
-            isPlaying = parsed.isPlaying
-            onStateChange?(parsed.isPlaying)
-        }
-        if let newTrack = parsed.track, newTrack.id != previousID {
-            onTrackChange?(newTrack)
-        }
+        if let seconds = parsed.position { lastPosition = (seconds, CACurrentMediaTime()) }
+        let stateChanged = isPlaying != parsed.isPlaying
+        isPlaying = parsed.isPlaying
+
+        if let newTrack = parsed.track, newTrack.id != previousID { onTrackChange?(newTrack) }
+        if let seconds = parsed.position { onPositionUpdate?(seconds) }
+        if stateChanged { onStateChange?(parsed.isPlaying) }
+    }
+
+    // Spotify quit: forget the song and report the stop, so nothing keeps
+    // interpolating a position for a player that's gone
+    func reset() {
+        track = nil
+        lastPosition = nil
+        guard isPlaying else { return }
+        isPlaying = false
+        onStateChange?(false)
     }
 }
 

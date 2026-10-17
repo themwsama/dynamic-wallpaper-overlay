@@ -40,7 +40,9 @@ final class LyricsController {
         }
     }
 
-    // `position` is the one Spotify sent with this change, if it's fresh
+    // `position` is the one Spotify sent with this change, if it's fresh.
+    // The old song's lyrics and line go first, then the clock moves, so no tick
+    // can pair the previous song's lines with the new song's position.
     func trackChanged(_ track: SpotifyTrack, position: (seconds: TimeInterval, at: CFTimeInterval)?) {
         trackID = track.id
         lyrics = nil
@@ -92,12 +94,17 @@ final class LyricsController {
         updateVisibility()
     }
 
-    // Spotify stopped (not just paused): forget the song entirely
+    // Spotify stopped (not just paused): forget the song entirely. Safe to call
+    // before or after the final playStateChanged(false), and more than once.
     func playbackEnded() {
         trackID = nil
         lookupGeneration += 1
         lyrics = nil
+        shownIndex = nil
+        isPlaying = false
+        clock.setPlaying(false)
         clock.reset()
+        views().forEach { $0.clear() }
         updateVisibility()
     }
 
@@ -161,49 +168,5 @@ final class LyricsController {
         views().forEach {
             $0.show(text: line.text, romaji: romaji, duration: remaining, accent: color, reducedMotion: reducedMotion)
         }
-    }
-}
-
-// Spotify's broadcast only arrives on changes, so ask once at launch what's
-// already playing and replay it as if Spotify had just announced it.
-// Only runs when Spotify is open, since the script would otherwise launch it.
-func fetchSpotifyNowPlaying(completion: @escaping ([AnyHashable: Any]?) -> Void) {
-    guard !NSRunningApplication.runningApplications(withBundleIdentifier: SPOTIFY_BUNDLE_ID).isEmpty else {
-        NSLog("wallpaper-overlay: Spotify isn't running at launch; waiting for its first broadcast")
-        completion(nil)
-        return
-    }
-    DispatchQueue.global(qos: .utility).async {
-        let source = """
-        tell application "Spotify"
-            set t to current track
-            return (player state as string) & linefeed & (id of t) & linefeed & (name of t) & linefeed & ¬
-                (artist of t) & linefeed & (album of t) & linefeed & (duration of t) & linefeed & (player position)
-        end tell
-        """
-        var error: NSDictionary?
-        let output = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
-        let fields = output?.components(separatedBy: "\n") ?? []
-        // Typed on purpose: inside the [AnyHashable: Any] literal `capitalized`
-        // resolved to a function and `??` to an Optional, so the state never read
-        // as "Playing" and the numbers never as NSNumber
-        let state: String = fields.first?.capitalized ?? ""
-        func number(_ index: Int) -> Double {
-            guard index < fields.count else { return 0 }
-            return Double(fields[index].replacingOccurrences(of: ",", with: ".")) ?? 0
-        }
-        let info: [AnyHashable: Any]? = fields.count == 7 ? [
-            "Player State": state,
-            "Track ID": fields[1],
-            "Name": fields[2],
-            "Artist": fields[3],
-            "Album": fields[4],
-            "Duration": number(5),
-            "Playback Position": number(6),
-        ] : nil
-        if info == nil {
-            NSLog("wallpaper-overlay: couldn't read Spotify's current track: %@", error?.description ?? "no output")
-        }
-        DispatchQueue.main.async { completion(info) }
     }
 }

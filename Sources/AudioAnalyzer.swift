@@ -15,7 +15,7 @@ let SILENCE_FLOOR: Float = 0.002
 let TEMPO_BEAT_HISTORY = 9                  // beats kept; tempo from the median of their gaps
 let TEMPO_MIN_BPM: Double = 60              // estimates outside this range are halved/doubled
 let TEMPO_MAX_BPM: Double = 180
-let TEMPO_MAX_GAP: CFTimeInterval = 2       // a longer silence restarts the estimate
+let TEMPO_MAX_GAP: CFTimeInterval = 2       // a longer silence or beatless stretch forgets the tempo
 
 struct AudioLevels {
     var level: Float = 0                 // smoothed loudness, 0..~1
@@ -59,6 +59,9 @@ final class AudioAnalyzer {
         let bass = (bassSquares / Float(frames)).squareRoot()
         let dt = Float(frames) / sampleRate
 
+        // A long gap is a pause, a break or a new song: the old tempo must not carry over
+        if time - levels.lastBeat > TEMPO_MAX_GAP { forgetTempo() }
+
         let levelTau = rms > levels.level ? LEVEL_ATTACK_SECONDS : LEVEL_RELEASE_SECONDS
         levels.level += (rms - levels.level) * (1 - exp(-dt / levelTau))
         let bassTau = bass > levels.bass ? LEVEL_ATTACK_SECONDS : LEVEL_RELEASE_SECONDS
@@ -73,8 +76,12 @@ final class AudioAnalyzer {
         if rms > SILENCE_FLOOR { levels.lastSound = time }
     }
 
+    private func forgetTempo() {
+        beatCount = 0
+        levels.bpm = 0
+    }
+
     private func recordBeat(at time: CFTimeInterval) {
-        if time - levels.lastBeat > TEMPO_MAX_GAP { beatCount = 0 }
         if beatCount == TEMPO_BEAT_HISTORY {
             for i in 1..<TEMPO_BEAT_HISTORY { beatTimes[i - 1] = beatTimes[i] }
             beatCount -= 1

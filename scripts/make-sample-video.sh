@@ -4,7 +4,10 @@
 # Feed the result to make-wallpaper.sh.
 set -euo pipefail
 
-CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/wallpaper-overlay}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+config_dir_init
 OUT="$CONFIG_DIR/sample-input.mp4"
 
 usage() {
@@ -14,6 +17,7 @@ Usage: $(basename "$0") [--out PATH]
 Creates a 16-second seamless-looping abstract video (2560x1440, 30fps, no audio).
   --out PATH   output file (default: $OUT)
   -h, --help   show this help
+DRY_RUN=1 (any value except 0/false/no/off) prints the plan only.
 USAGE
 }
 
@@ -25,8 +29,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-command -v ffmpeg >/dev/null 2>&1 || { echo "error: ffmpeg not found: brew install ffmpeg" >&2; exit 1; }
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found: brew install ffmpeg"
+if is_dry_run; then
+  echo "[dry-run] would encode a 16 s sample video to $OUT with ffmpeg"
+  exit 0
+fi
 mkdir -p "$(dirname "$OUT")"
+TMP_OUT="$(dirname "$OUT")/.$(basename "$OUT").tmp.$$"
+trap 'rm -f "$TMP_OUT"' EXIT
 
 # Every animated term is sin/cos of 2*PI*k*T/16 with integer k, so frame 480
 # equals frame 0 and the loop is seamless.
@@ -45,9 +55,14 @@ R="clip(30+70*$FIELD+40*$FIELD2+110*($B),0,255)"
 G="clip(25+40*$FIELD2+25*$FIELD+80*($B),0,255)"
 Bl="clip(60+110*$FIELD+50*(1-$FIELD2)+90*($B),0,255)"
 
+# BT.709 limited-range output; setparams makes the frames (and so the stream) carry the tags,
+# since the -color_* options alone left primaries/trc unset (ffmpeg 9).
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -i "color=c=black:s=320x180:r=30:d=16,format=gbrp,geq=r='$R':g='$G':b='$Bl'" \
-  -vf "scale=2560:1440:flags=bicubic,gblur=sigma=6,noise=alls=3:allf=t,format=yuv420p" \
-  -r 30 -t 16 -an -c:v libx264 -crf 16 -preset medium -movflags +faststart "$OUT"
+  -vf "scale=2560:1440:flags=bicubic,gblur=sigma=6,noise=alls=3:allf=t,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv" \
+  -r 30 -t 16 -an -c:v libx264 -crf 16 -preset medium \
+  -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+  -f mp4 -movflags +faststart "$TMP_OUT" || die "ffmpeg failed"
+mv "$TMP_OUT" "$OUT"
 
 echo "wrote $OUT"

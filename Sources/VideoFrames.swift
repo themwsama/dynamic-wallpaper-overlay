@@ -14,6 +14,8 @@ final class VideoFrameSource {
     ])
     private var latest: CVPixelBuffer?
     private var loopObserver: NSObjectProtocol?
+    private var statusObservation: NSKeyValueObservation?
+    private var hasLoggedFailure = false
 
     init?(url: URL) {
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -32,10 +34,26 @@ final class VideoFrameSource {
         ) { [weak self] _ in
             self?.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         }
+        // A corrupt or unsupported file only fails after init; without this the
+        // wallpaper would stay transparent with nothing in the log
+        statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            DispatchQueue.main.async { self?.reportFailure(item.error) }
+        }
         player.play()
     }
 
+    // Logs once; pixelBuffer keeps returning nil so the renderer draws nothing
+    private func reportFailure(_ error: Error?) {
+        guard !hasLoggedFailure else { return }
+        hasLoggedFailure = true
+        latest = nil
+        NSLog("wallpaper-overlay: backdrop video failed to load: %@",
+              error.map { "\($0.localizedDescription) (\($0))" } ?? "unknown error")
+    }
+
     deinit {
+        statusObservation?.invalidate()
         loopObserver.map(NotificationCenter.default.removeObserver)
     }
 
@@ -51,6 +69,7 @@ final class VideoFrameSource {
 
     // Newest decoded frame for the given host time, or the last one if nothing new
     func pixelBuffer(atHostTime hostTime: CFTimeInterval) -> CVPixelBuffer? {
+        guard item.status != .failed else { return nil }
         let itemTime = output.itemTime(forHostTime: hostTime)
         if output.hasNewPixelBuffer(forItemTime: itemTime),
            let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {

@@ -2,8 +2,35 @@
 // row leaves room at its right end for the gear button (its own window).
 import AppKit
 
+let SUB_MIN_FONT_SCALE: CGFloat = 0.6  // a long subtitle shrinks to this fraction, then overflows
+
+// How the subtitle is drawn: possibly shrunk to fit, then letter-spaced to span `available`
+struct SubtitleLayout {
+    let font: NSFont
+    let tracking: CGFloat
+    let isShrunk: Bool
+    let overflows: Bool
+}
+
+func subtitleLayout(text: String, font: NSFont, available: CGFloat) -> SubtitleLayout {
+    func width(_ f: NSFont) -> CGFloat { tracked(text, font: f, tracking: 0, color: TEXT_COLOR).size().width }
+    let natural = width(font)
+    var fitted = font
+    if natural > available, natural > 0 {
+        let scale = max(SUB_MIN_FONT_SCALE, available / natural)
+        fitted = NSFont(descriptor: font.fontDescriptor, size: font.pointSize * scale) ?? font
+    }
+    let fittedWidth = width(fitted)
+    let gaps = text.count - 1
+    // Fewer than two characters have no gaps to spread; never negative tracking
+    let tracking = gaps >= 1 ? max(0, (available - fittedWidth) / CGFloat(gaps)) : 0
+    return SubtitleLayout(font: fitted, tracking: tracking,
+                          isShrunk: fitted !== font, overflows: fittedWidth > available)
+}
+
 final class BlockView: NSView {
     override var isFlipped: Bool { true }
+    private static var hasLoggedSubtitleFit = false
 
     static func nameWidth() -> CGFloat {
         visibleWidth(tracked(NAME_TEXT, font: NAME_FONT, tracking: NAME_TRACKING, color: TEXT_COLOR),
@@ -50,10 +77,17 @@ final class BlockView: NSView {
         y += RULE_WIDTH + SUB_GAP
 
         // Track the subtitle so it spans the name's width, minus the gear at its end
-        let plainSub = tracked(SUB_TEXT, font: SUB_FONT, tracking: 0, color: TEXT_COLOR)
-        let subWidth = nameWidth - GEAR_SIZE - GEAR_GAP
-        let subTracking = (subWidth - plainSub.size().width) / CGFloat(SUB_TEXT.count - 1)
-        let sub = tracked(SUB_TEXT, font: SUB_FONT, tracking: subTracking, color: TEXT_COLOR)
+        let layout = subtitleLayout(text: SUB_TEXT, font: SUB_FONT, available: nameWidth - GEAR_SIZE - GEAR_GAP)
+        logSubtitleFitOnce(layout)
+        let sub = tracked(SUB_TEXT, font: layout.font, tracking: layout.tracking, color: TEXT_COLOR)
         sub.draw(at: NSPoint(x: right - nameWidth, y: y))
+    }
+
+    // draw() runs often; say it once
+    private func logSubtitleFitOnce(_ layout: SubtitleLayout) {
+        guard layout.isShrunk || layout.overflows, !Self.hasLoggedSubtitleFit else { return }
+        Self.hasLoggedSubtitleFit = true
+        NSLog("wallpaper-overlay: subtitle is wider than the name; %@",
+              layout.overflows ? "shrunk to the minimum size and still overflows, shorten it" : "shrunk to fit")
     }
 }

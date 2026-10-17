@@ -24,6 +24,30 @@ let LYRICS_ENTRY_BLUR: CGFloat = 8
 let LYRICS_FADE_DURATION: CFTimeInterval = 0.6  // whole box, on pause or toggle
 let LYRICS_JAPANESE_FONT = "HiraMinProN-W6"
 let LYRICS_LATIN_FONT = "Baskerville-SemiBold"
+let LYRICS_SWEEP_MIN_DURATION: TimeInterval = 0.5
+let LYRICS_SWEEP_TAIL: TimeInterval = 0.3  // the sweep ends this long before the line does
+let LYRICS_SWEEP_ENTRY_SHARE: Double = 0.8  // the sweep starts once this much of the entry has played
+
+struct SweepSlot: Equatable {
+    let begin: CFTimeInterval
+    let duration: TimeInterval
+}
+
+// When each row's karaoke sweep starts and how long it runs. The sweep as a whole
+// starts after the entry delay and ends LYRICS_SWEEP_TAIL before `lineDuration` is
+// up, split between rows in proportion to their length, one after the other.
+func sweepSchedule(rowLengths: [Int], now: CFTimeInterval, entryDelay: TimeInterval,
+                   lineDuration: TimeInterval) -> [SweepSlot] {
+    let totalLength = rowLengths.reduce(0, +)
+    guard totalLength > 0 else { return [] }
+    let total = max(LYRICS_SWEEP_MIN_DURATION, lineDuration - entryDelay - LYRICS_SWEEP_TAIL)
+    var begin = now + entryDelay
+    return rowLengths.map { length in
+        let slot = SweepSlot(begin: begin, duration: total * Double(length) / Double(totalLength))
+        begin += slot.duration
+        return slot
+    }
+}
 
 func containsJapanese(_ text: String) -> Bool {
     text.unicodeScalars.contains { (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) }
@@ -64,7 +88,7 @@ final class LyricsView: NSView {
         current = nil
     }
 
-    // `duration` is how long the line stays up; the karaoke sweep spans it.
+    // `duration` is how long the line stays up; the karaoke sweep spans most of it.
     // Long lines wrap onto two rows; the sweep crosses them in reading order.
     func show(text: String, romaji: String?, duration: TimeInterval, accent: NSColor, reducedMotion: Bool) {
         retireCurrentLine()
@@ -86,11 +110,10 @@ final class LyricsView: NSView {
 
         // Bottom-up: romaji on the floor of the box, the rows stacked above it
         let now = CACurrentMediaTime()
-        let sweepStart = now + (reducedMotion ? 0 : LYRICS_ENTRY_DURATION * 0.8)
-        let sweepTotal = max(0.5, duration - (sweepStart - now) - 0.3)
-        let totalCharacters = Double(rows.reduce(0) { $0 + $1.count })
+        let sweeps = sweepSchedule(rowLengths: rows.map(\.count), now: now,
+                                   entryDelay: reducedMotion ? 0 : LYRICS_ENTRY_DURATION * LYRICS_SWEEP_ENTRY_SHARE,
+                                   lineDuration: duration)
         var characterIndex = 0
-        var sweepBegin = sweepStart
         for (rowIndex, row) in rows.enumerated() {
             let y = romajiHeight + (romaji == nil ? 0 : LYRICS_LINE_GAP) + CGFloat(rows.count - 1 - rowIndex) * rowHeight
             let line = tracked(row, font: font, tracking: LYRICS_TRACKING, color: TEXT_COLOR)
@@ -104,11 +127,10 @@ final class LyricsView: NSView {
                 container.addSublayer(glyph)
                 if !reducedMotion { animateEntry(glyph, begin: now + Double(characterIndex) * LYRICS_CHAR_STAGGER) }
             }
-            let rowDuration = sweepTotal * Double(row.count) / max(1, totalCharacters)
+            let slot = sweeps[rowIndex]
             addSweep(to: container, line: line, accent: accent,
                      frame: NSRect(x: 0, y: y, width: visibleWidth(line, tracking: LYRICS_TRACKING) + 4, height: rowHeight),
-                     begin: sweepBegin, duration: rowDuration, scale: scale)
-            sweepBegin += rowDuration
+                     begin: slot.begin, duration: slot.duration, scale: scale)
         }
         if let romaji {
             let text = CATextLayer()
@@ -202,7 +224,8 @@ final class LyricsView: NSView {
         DispatchQueue.main.asyncAfter(deadline: .now() + settle) { [weak glyph] in glyph?.filters = nil }
     }
 
-    // The line again in the accent color, revealed left to right by a growing mask
+    // The line again in the accent color, revealed left to right by a growing mask.
+    // `begin` and `duration` come from sweepSchedule and are used as they are.
     private func addSweep(to container: CALayer, line: NSAttributedString, accent: NSColor, frame: NSRect,
                           begin: CFTimeInterval, duration: TimeInterval, scale: CGFloat) {
         let colored = NSMutableAttributedString(attributedString: line)
@@ -226,7 +249,7 @@ final class LyricsView: NSView {
         grow.fromValue = 0
         grow.toValue = frame.width
         grow.beginTime = begin
-        grow.duration = max(0.5, duration - (begin - CACurrentMediaTime()) - 0.3)
+        grow.duration = duration
         grow.fillMode = .both
         grow.isRemovedOnCompletion = false
         mask.add(grow, forKey: "sweep")

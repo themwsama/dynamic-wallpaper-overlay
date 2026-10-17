@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # One-shot installer: config, wallpaper video, app build, LaunchAgent. Idempotent.
-# Env: DRY_RUN=1 (print actions only), OUT_DIR, BUNDLE_ID, CONFIG_DIR.
+# Env: DRY_RUN (any value except 0/false/no/off: print actions only), OUT_DIR, BUNDLE_ID,
+#      CONFIG_DIR, LOG_PATH.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export OUT_DIR="${OUT_DIR:-$HOME/Applications}"
-export BUNDLE_ID="${BUNDLE_ID:-local.wallpaper-overlay}"
-export CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/wallpaper-overlay}"
-DRY_RUN="${DRY_RUN:-0}"
+# shellcheck source=lib.sh
+source "$REPO/scripts/lib.sh"
+env_path OUT_DIR "$DEFAULT_OUT_DIR"
+config_dir_init
+env_path LOG_PATH "$DEFAULT_LOG_PATH"
+validate_bundle_id
 APP="$OUT_DIR/Wallpaper Overlay.app"
 EXE="$APP/Contents/MacOS/wallpaper-overlay"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
-LOG="$HOME/Library/Logs/wallpaper-overlay.log"
 VIDEO_DEFAULT="$CONFIG_DIR/wallpaper-stacked.mp4"
 DOMAIN="gui/$(id -u)"
 
@@ -30,7 +32,7 @@ Usage: $(basename "$0") [options]
   --force-config     overwrite an existing config.json
   -h, --help         show this help
 With neither --video nor --sample, an existing wallpaper is kept; otherwise the sample is used.
-DRY_RUN=1 prints every action without doing it.
+DRY_RUN=1 (any value except 0/false/no/off) prints every action without doing it.
 USAGE
 }
 
@@ -49,10 +51,41 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+BOOTED_OUT=0
+TMP_PLIST=""
+# EXIT trap: drop temp plist; if we stopped the agent and failed before restarting it, bring the old one back.
+on_exit() {
+  local rc=$?
+  [[ -z "$TMP_PLIST" ]] || rm -f "$TMP_PLIST"
+  if (( rc != 0 && BOOTED_OUT == 1 )) && [[ -f "$PLIST" ]]; then
+    echo "install failed (exit $rc); restarting the previous LaunchAgent $BUNDLE_ID" >&2
+    launchctl bootstrap "$DOMAIN" "$PLIST" || echo "warning: could not restart $BUNDLE_ID; run: launchctl bootstrap $DOMAIN \"$PLIST\"" >&2
+  fi
+}
+trap on_exit EXIT
+
 say() { echo "==> $*"; }
-# Run a command, or just print it under DRY_RUN=1.
-run() { if [[ "$DRY_RUN" == 1 ]]; then echo "[dry-run] $*"; else "$@"; fi; }
-json_escape() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+# Escape for a JSON string body: backslash, quote, \b \f \n \r \t, other controls as \u00XX.
+json_escape() {
+  local s="$1" out="" c code i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$c"
+        if (( code >= 0 && code < 32 )); then printf -v c '\\u%04x' "$code"; fi
+        out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
 
 # --- requirements
 say "checking requirements"
@@ -67,9 +100,17 @@ echo "ok ($(uname -m))"
 say "config directory $CONFIG_DIR"
 run mkdir -p "$CONFIG_DIR"
 CONFIG="$CONFIG_DIR/config.json"
+# Install marker: lets uninstall.sh delete a CONFIG_DIR not named wallpaper-overlay; records --set-desktop.
+MARKER="$CONFIG_DIR/$CONFIG_MARKER"
+if is_dry_run; then
+  echo "[dry-run] write install marker $MARKER (set_desktop=$SET_DESKTOP or previous)"
+else
+  if [[ $SET_DESKTOP -eq 1 ]] || install_marker_has "set_desktop=1"; then MARKER_BODY="set_desktop=1"; else MARKER_BODY="set_desktop=0"; fi
+  printf '%s\n' "wallpaper-overlay install marker" "$MARKER_BODY" > "$MARKER"
+fi
 if [[ -f "$CONFIG" && $FORCE_CONFIG -eq 0 ]]; then
   echo "config.json exists; keeping it (use --force-config to overwrite)"
-elif [[ "$DRY_RUN" == 1 ]]; then
+elif is_dry_run; then
   echo "[dry-run] write $CONFIG from config.example.json (name='${NAME:-<example>}', subtitle='${SUBTITLE:-<example>}')"
 else
   [[ -f "$REPO/config.example.json" ]] || { echo "error: missing $REPO/config.example.json" >&2; exit 1; }
@@ -101,14 +142,16 @@ elif [[ $SAMPLE -eq 1 || ! -f "$VIDEO_DEFAULT" ]]; then
 else
   say "keeping existing wallpaper $VIDEO_DEFAULT"
   if [[ $SET_DESKTOP -eq 1 && -f "$CONFIG_DIR/wallpaper-still.png" ]]; then
-    run osascript -e "tell application \"System Events\" to tell every desktop to set picture to POSIX file \"$CONFIG_DIR/wallpaper-still.png\""
+    set_desktop_picture "$CONFIG_DIR/wallpaper-still.png"
   fi
 fi
 
-# --- stop a running copy before its bundle is replaced
+# --- stop a running copy just before the bundle is replaced (the wallpaper file was swapped by mv,
+# so a running player keeps its old inode). If anything fails after this, the EXIT trap restarts it.
 if [[ $LOGIN_ITEM -eq 1 ]] && launchctl print "$DOMAIN/$BUNDLE_ID" >/dev/null 2>&1; then
   say "stopping loaded LaunchAgent $BUNDLE_ID"
   run launchctl bootout "$DOMAIN/$BUNDLE_ID"
+  is_dry_run || BOOTED_OUT=1
 fi
 
 # --- build
@@ -118,35 +161,27 @@ run "$REPO/scripts/build.sh"
 # --- LaunchAgent
 if [[ $LOGIN_ITEM -eq 1 ]]; then
   say "writing LaunchAgent $PLIST"
-  if [[ "$DRY_RUN" == 1 ]]; then
-    echo "[dry-run] write plist: Label=$BUNDLE_ID ProgramArguments=$EXE RunAtLoad KeepAlive ProcessType=Interactive StandardErrorPath=$LOG"
+  if is_dry_run; then
+    echo "[dry-run] write plist: Label=$BUNDLE_ID ProgramArguments=$EXE RunAtLoad KeepAlive ProcessType=Interactive StandardErrorPath=$LOG_PATH EnvironmentVariables{WALLPAPER_OVERLAY_DIR=$CONFIG_DIR WALLPAPER_OVERLAY_LOG=$LOG_PATH}"
   else
-    mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
-    cat > "$PLIST" <<PLISTEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>$BUNDLE_ID</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>$EXE</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<true/>
-	<key>ProcessType</key>
-	<string>Interactive</string>
-	<key>StandardErrorPath</key>
-	<string>$LOG</string>
-</dict>
-</plist>
-PLISTEOF
-    plutil -lint "$PLIST" >/dev/null
+    mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG_PATH")"
+    TMP_PLIST="$PLIST.tmp.$$"
+    plutil -create xml1 "$TMP_PLIST"
+    plutil -insert Label -string "$BUNDLE_ID" "$TMP_PLIST"
+    plutil -insert ProgramArguments -array "$TMP_PLIST"
+    plutil -insert ProgramArguments -string "$EXE" -append "$TMP_PLIST"
+    plutil -insert RunAtLoad -bool YES "$TMP_PLIST"
+    plutil -insert KeepAlive -bool YES "$TMP_PLIST"
+    plutil -insert ProcessType -string Interactive "$TMP_PLIST"
+    plutil -insert StandardErrorPath -string "$LOG_PATH" "$TMP_PLIST"
+    plutil -insert EnvironmentVariables -dictionary "$TMP_PLIST"
+    plutil -insert EnvironmentVariables.WALLPAPER_OVERLAY_DIR -string "$CONFIG_DIR" "$TMP_PLIST"
+    plutil -insert EnvironmentVariables.WALLPAPER_OVERLAY_LOG -string "$LOG_PATH" "$TMP_PLIST"
+    plutil -lint "$TMP_PLIST" >/dev/null || { echo "error: generated LaunchAgent plist is invalid" >&2; exit 1; }
+    mv "$TMP_PLIST" "$PLIST"
   fi
   run launchctl bootstrap "$DOMAIN" "$PLIST"
+  BOOTED_OUT=0
 else
   say "skipping LaunchAgent (--no-login-item); start manually: open \"$APP\""
 fi
@@ -163,5 +198,5 @@ Optional API keys (stored in your Keychain):
   security add-generic-password -s wallpaper-overlay -a spotify-client-id -w
   security add-generic-password -s wallpaper-overlay -a spotify-client-secret -w
 
-Log: $LOG
+Log: $LOG_PATH
 NOTES

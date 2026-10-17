@@ -1,7 +1,9 @@
 // Tells the overlay when nobody can see the wallpaper: displays asleep,
 // screen locked, another user's session in front, or every backdrop window
 // fully covered (e.g. a full-screen app). The renderer pauses then, and
-// lets go of its video frames.
+// lets go of its video frames. Each backdrop view tracks its own window's
+// occlusion (see BackdropView), so a covered screen can stop drawing while the
+// others keep going.
 import AppKit
 
 final class VisibilityMonitor {
@@ -23,7 +25,7 @@ final class VisibilityMonitor {
         let distributed = DistributedNotificationCenter.default()
         observe(distributed, Notification.Name("com.apple.screenIsLocked")) { $0.isLocked = true }
         observe(distributed, Notification.Name("com.apple.screenIsUnlocked")) { $0.isLocked = false }
-        observe(NotificationCenter.default, NSWindow.didChangeOcclusionStateNotification) { _ in }
+        observeOcclusion()
     }
 
     deinit {
@@ -37,6 +39,13 @@ final class VisibilityMonitor {
             self.reevaluate()
         }
         observers.append((center, token))
+    }
+
+    private func observeOcclusion() {
+        let token = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.reevaluate() }
+        observers.append((NotificationCenter.default, token))
     }
 
     // Also called after the backdrop windows are rebuilt

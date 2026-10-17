@@ -1,6 +1,9 @@
 // Persisted user settings, backed by UserDefaults and shared across the overlay.
 import Foundation
 
+// TransitionStyle.stormRewind; main.swift falls back to the same value for unknown raws
+let DEFAULT_TRANSITION_STYLE_RAW = 1
+
 // Raw values are the on-disk UserDefaults keys; existing ones must never be renamed
 enum SettingKey: String, CaseIterable {
     case clockVisible, effectsVisible, transitionStyle
@@ -27,7 +30,7 @@ final class Settings {
 
     // Raw value of the transition style enum, which lives elsewhere
     var transitionStyleRaw: Int {
-        get { (defaults.object(forKey: SettingKey.transitionStyle.rawValue) as? Int) ?? 1 }
+        get { (defaults.object(forKey: SettingKey.transitionStyle.rawValue) as? Int) ?? DEFAULT_TRANSITION_STYLE_RAW }
         set {
             guard newValue != transitionStyleRaw else { return }
             defaults.set(newValue, forKey: SettingKey.transitionStyle.rawValue)

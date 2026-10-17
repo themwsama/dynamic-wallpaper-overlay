@@ -45,7 +45,17 @@ let TILE_ON_INK = NSColor(srgbRed: 0.11, green: 0.14, blue: 0.25, alpha: 1)
 
 // Video backdrop: original animation and the glass version, with animated
 // transitions between them (see Transition.metal)
-let OVERLAY_DIR = URL(fileURLWithPath: NSHomeDirectory() + "/.config/wallpaper-overlay")
+let OVERLAY_DIR_ENV = "WALLPAPER_OVERLAY_DIR"
+let DEFAULT_OVERLAY_DIR = "~/.config/wallpaper-overlay"
+
+// The install script exports WALLPAPER_OVERLAY_DIR to the LaunchAgent when the
+// user picked a non-default directory; unset or empty means the default
+func resolveOverlayDir(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+    let raw = env[OVERLAY_DIR_ENV].flatMap { $0.isEmpty ? nil : $0 } ?? DEFAULT_OVERLAY_DIR
+    return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+}
+
+let OVERLAY_DIR = resolveOverlayDir()
 let BACKDROP_VIDEO_URL = CONFIG.wallpaperVideoURL
 let TRANSITION_SHADER_URL = OVERLAY_DIR.appendingPathComponent("Transition.metal")
 let VIDEO_SIZE = NSSize(width: 2560, height: 1440)  // one half of the stacked file

@@ -106,11 +106,20 @@ What `install.sh` does, in order:
    (RunAtLoad + KeepAlive), so it starts at login and restarts if it crashes.
 6. Prints the permission prompts to expect and how to add optional API keys.
 
-Environment overrides: `BUNDLE_ID` (default `local.wallpaper-overlay`) and
-`OUT_DIR` (default `~/Applications`).
+Environment overrides: `BUNDLE_ID` (default `local.wallpaper-overlay`),
+`OUT_DIR` (default `~/Applications`), `CONFIG_DIR` (default
+`~/.config/wallpaper-overlay`), `LOG_PATH` (default
+`~/Library/Logs/wallpaper-overlay.log`) and `DRY_RUN` (any value except
+0/false/no/off counts as on). The LaunchAgent passes `WALLPAPER_OVERLAY_DIR` and
+`WALLPAPER_OVERLAY_LOG` to the app.
 
-Uninstall: `scripts/uninstall.sh` (add `--keep-config` to keep the config and
-wallpaper).
+If you changed `BUNDLE_ID`, use your `$BUNDLE_ID` in every `launchctl` command
+below instead of `local.wallpaper-overlay`.
+
+Uninstall: `scripts/uninstall.sh`. Flags: `--keep-config` (keep the config and
+wallpaper), `--yes` (skip the confirmation) and `--reset-desktop` (reset the
+desktop picture if it is the overlay's still frame). It also removes the
+preferences plist.
 
 ---
 
@@ -127,7 +136,7 @@ All of these sit **behind** normal app windows, like a real wallpaper:
 | **Clock card** | Glass stopwatch / countdown timer under the name; it slides out of the way when the control center opens |
 | **Music glow** | While Spotify plays: a soft glow along the bottom edge that pulses with the real beat, colored by the song's genre, with fire sparks launched on the beat at the song's tempo |
 | **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese |
-| **Efficiency** | ~200 MB memory while visible; pauses and releases all video memory when the screen sleeps or locks, or the desktop is fully covered; 30 fps cap in Low Power Mode |
+| **Efficiency** | ~200 MB memory while visible; pauses and releases all video memory when the screen sleeps or locks, or the desktop is fully covered. Each screen pauses on its own when covered. Idle rendering is capped at about 1.25× the video resolution; 30 fps cap in Low Power Mode |
 
 ---
 
@@ -155,7 +164,7 @@ permission again after rebuilding. Re-allow it in System Settings.
 | File | Responsibility |
 |---|---|
 | `main.swift` | `OverlayController`: creates the per-screen windows, wires every subsystem, owns lifecycle (rebuild on display change, visibility, audio-tap suspend) |
-| `Config.swift` | Reads `~/.config/wallpaper-overlay/config.json` (name, subtitle, fonts, nixie number, video path) with safe defaults |
+| `Config.swift` | Reads `~/.config/wallpaper-overlay/config.json` (name, subtitle, fonts, nixie number, video path); validates each key on its own, with safe defaults |
 | `Style.swift` | All layout/look constants and window levels; personal values come from `CONFIG` |
 | `Settings.swift` | UserDefaults-backed toggles (clock, glass, transition, glow, lyrics, romaji) with observers |
 | `TextBlock.swift` | Draws the name, rule and subtitle; leaves room for the gear |
@@ -176,6 +185,8 @@ permission again after rebuilding. Re-allow it in System Settings.
 | `LyricsView.swift` | Core Animation kinetic text: per-character rise/blur-in, karaoke sweep, two-row wrap |
 | `VisibilityMonitor.swift` | Sleep/lock/session/occlusion detection → pause rendering and free frames |
 | `Housekeeping.swift` | Prunes the lyrics cache (60 days / 400 files) and trims the log in place (2 MB → 500 KB) every 6 h |
+| `SpotifyNowPlaying.swift` | Launch-time "what's playing" query; all Spotify AppleScript calls share one serial queue (`SPOTIFY_BUNDLE_ID`) |
+| `scripts/lib.sh` | Shared script helpers: env overrides, `DRY_RUN` parsing, `BUNDLE_ID` validation, default paths |
 
 ### 7.2 Windows and z-order (lowest to highest)
 
@@ -228,6 +239,8 @@ LRCLIB, and (if keyed) Spotify/Gemini. Audio never leaves the machine.
 | `~/.config/wallpaper-overlay/lyrics-cache/` | Per-track synced lyrics (pruned automatically) |
 | `~/Library/Logs/wallpaper-overlay.log` | Log (trimmed automatically) |
 | `~/Library/Preferences/<bundle id>.plist` | Toggle states from the control center |
+
+`WALLPAPER_OVERLAY_DIR` and `WALLPAPER_OVERLAY_LOG` are set only via the LaunchAgent, so launching the app by hand uses the defaults; re-run `install.sh` after changing `CONFIG_DIR` (`build.sh --install` doesn't refresh the plist).
 
 ---
 
@@ -322,9 +335,13 @@ scripts/build.sh            # build the app bundle only
 scripts/build.sh --install  # build and restart the running LaunchAgent
 ```
 
-The shader is not compiled at build time. Syntax errors show up at launch in
-the log as `transition shader failed`, and the overlay then runs without the
-video backdrop.
+The shader is not compiled at build time. It ships inside the app at
+`Contents/Resources/Transition.metal`. The user-editable copy at
+`~/.config/wallpaper-overlay/Transition.metal` is created on the first build and
+never overwritten by builds; if it differs from the repo copy, the build prints a
+`diff` command to compare them. At launch, if the config-dir shader fails to
+compile, the app logs the error and falls back to the bundled shader. The
+overlay runs without the video backdrop only if neither copy compiles.
 
 ### 9.2 Tests
 
@@ -355,7 +372,8 @@ using invented text.
 - Comments explain *why*, not what.
 - Audio-thread code (`AudioAnalyzer.process`) must not allocate or lock.
 - `Uniforms` in `Transition.metal` and `TransitionUniforms` in Swift must match
-  field for field (16-byte aligned `float4`s; stride 160).
+  field for field (16-byte aligned `float4`s; stride 160). The app checks the
+  Swift stride at startup and logs an error if the Metal buffer size differs.
 
 ---
 
@@ -389,8 +407,9 @@ wallpaper-overlay: wallpaper hidden, pausing and releasing frames
 | Symptom | Cause | Fix |
 |---|---|---|
 | Wallpaper never changes / looks like the plain desktop | Video file missing or no decoded frames | Check `wallpaperVideo` in config and the log for `backdrop video missing`; re-run `make-wallpaper.sh` |
-| Nothing visual after editing the shader | Metal compile error | Log shows `transition shader failed`; fix `Transition.metal` and restart |
-| Glow ignores the beat | Audio permission denied or reset by a rebuild | Re-allow "System Audio Recording Only" for Wallpaper Overlay |
+| Shader edit broke visuals | Metal compile error in the config-dir `Transition.metal` | The log shows the error and the bundled shader is used; fix `Transition.metal` and restart |
+| Glow ignores the beat | Audio permission denied or reset by a rebuild | Re-allow "System Audio Recording Only" for Wallpaper Overlay. With no audio for 3 s, the glow falls back to the genre's tempo automatically |
+| Glow stops reacting after an audio device change | Audio device changed under the process tap | The tap rebuilds automatically; no action needed. Check the log if it doesn't recover |
 | Glow color never changes | Genre lookup failed | Log `genre ... (fallback)`. iTunes may rate-limit (~20/min); add Spotify/Gemini keys for fallbacks |
 | No lyrics for one song | LRCLIB has no synced version, or was briefly down (503, retried twice) | Log shows `lyrics ...: none`; expected for niche tracks |
 | Lyrics out of sync after seeking | Spotify Automation permission denied | Allow "control Spotify" for Wallpaper Overlay |

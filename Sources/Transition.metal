@@ -311,8 +311,11 @@ fragment float4 transitionFragment(VertexOut in [[stage_in]],
     } else if (style == 2) {
         col = worldLineShift(in.uv, vuv, luma, chroma, atlas, u);
     } else {
-        col = mix(sampleSource(luma, chroma, vuv, u.fromSource), sampleSource(luma, chroma, vuv, u.toSource),
-                  smoothstep(0.0, 1.0, u.progress));
+        // Idle (both sides the same half): one sample instead of two, same result
+        float3 from = sampleSource(luma, chroma, vuv, u.fromSource);
+        col = u.fromSource == u.toSource
+            ? from
+            : mix(from, sampleSource(luma, chroma, vuv, u.toSource), smoothstep(0.0, 1.0, u.progress));
     }
     // Screen blend: light adds without blowing out what's already bright
     float3 glow = saturate(musicGlow(in.uv, u));

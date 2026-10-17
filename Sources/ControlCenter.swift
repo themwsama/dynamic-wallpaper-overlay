@@ -119,6 +119,8 @@ final class ControlCenterPanel {
     }
 
     func open(topRight: NSPoint) {
+        // A second open would orphan the first panel and stack a second pair of event monitors
+        guard !isOpen else { return }
         let size = Self.size(tileCount: tiles.count)
         let frame = NSRect(x: topRight.x - size.width, y: topRight.y - size.height, width: size.width, height: size.height)
         let panel = ClickThroughFocusPanel(
