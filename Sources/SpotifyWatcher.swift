@@ -7,18 +7,19 @@
 import AppKit
 import QuartzCore
 
-let SPOTIFY_BUNDLE_ID = "com.spotify.client"
-let SPOTIFY_DISPLAY_NAME = "Spotify"
-let SPOTIFY_SCRIPT_QUEUE = DispatchQueue(label: "wallpaper-overlay.spotify-script", qos: .utility)
-let SPOTIFY_NOTIFICATION = Notification.Name("com.spotify.client.PlaybackStateChanged")
-let SPOTIFY_TRACK_ID_PREFIX = "spotify:track:"  // excludes episodes and local files
-let SPOTIFY_PLAYING_STATE = "Playing"
-let SPOTIFY_MS_PER_SECOND: Double = 1000  // "Duration" is milliseconds, "Playback Position" is seconds
-let SPOTIFY_KNOWN_STATES: Set<String> = [SPOTIFY_PLAYING_STATE, "Paused", "Stopped"]
+nonisolated let SPOTIFY_BUNDLE_ID = "com.spotify.client"
+nonisolated let SPOTIFY_DISPLAY_NAME = "Spotify"
+nonisolated let SPOTIFY_SCRIPT_QUEUE = DispatchQueue(label: "wallpaper-overlay.spotify-script", qos: .utility)
+nonisolated let SPOTIFY_NOTIFICATION = Notification.Name("com.spotify.client.PlaybackStateChanged")
+nonisolated let SPOTIFY_TRACK_ID_PREFIX = "spotify:track:"  // excludes episodes and local files
+nonisolated let SPOTIFY_PLAYING_STATE = "Playing"
+nonisolated let SPOTIFY_MS_PER_SECOND: Double = 1000  // "Duration" is milliseconds, "Playback Position" is seconds
+nonisolated let SPOTIFY_KNOWN_STATES: Set<String> = [SPOTIFY_PLAYING_STATE, "Paused", "Stopped"]
 // state, id, name, artist, album, duration (ms), position (s)
-let NOW_PLAYING_FIELD_COUNT = 7
+nonisolated let NOW_PLAYING_FIELD_COUNT = 7
 
-struct SpotifyTrack: Equatable {
+// Nonisolated and Sendable: parsed off the main actor (notification and script queues)
+nonisolated struct SpotifyTrack: Equatable, Sendable {
     let id: String
     let name: String
     let artist: String
@@ -30,17 +31,17 @@ struct SpotifyTrack: Equatable {
 typealias SpotifyPositionStamp = (seconds: TimeInterval, at: CFTimeInterval)
 
 // One report from Spotify: what's on, whether it plays, and where it is
-struct SpotifySnapshot {
+nonisolated struct SpotifySnapshot: Sendable {
     let track: SpotifyTrack?
     let isPlaying: Bool
     let position: TimeInterval?
 }
 
 // Runs an AppleScript source and returns its text output, or the error dictionary
-// when it failed. Called on SPOTIFY_SCRIPT_QUEUE.
-typealias SpotifyScriptRunner = (_ source: String) -> (output: String?, error: NSDictionary?)
+// when it failed. Called on SPOTIFY_SCRIPT_QUEUE, so it must be Sendable and nonisolated.
+typealias SpotifyScriptRunner = @Sendable (_ source: String) -> (output: String?, error: NSDictionary?)
 
-func runAppleScript(_ source: String) -> (output: String?, error: NSDictionary?) {
+nonisolated func runAppleScript(_ source: String) -> (output: String?, error: NSDictionary?) {
     var error: NSDictionary?
     let output = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
     return (output, error)
@@ -89,7 +90,10 @@ final class SpotifyWatcher {
                 NSLog("wallpaper-overlay: Spotify notification without userInfo")
                 return
             }
-            self?.handle(info)
+            // Parsed here so only the Sendable snapshot crosses into the main actor;
+            // delivered on `.main`, so this really is on the main actor
+            let snapshot = SpotifyWatcher.parse(info)
+            MainActor.assumeIsolated { self?.apply(snapshot) }
         }
     }
 
@@ -99,8 +103,9 @@ final class SpotifyWatcher {
         self.observer = nil
     }
 
-    // Pure so it can be tested without notifications
-    static func parse(_ userInfo: [AnyHashable: Any]) -> SpotifySnapshot {
+    // Pure so it can be tested without notifications. Nonisolated: also runs in the
+    // notification block before the hop to the main actor
+    nonisolated static func parse(_ userInfo: [AnyHashable: Any]) -> SpotifySnapshot {
         let state = userInfo["Player State"] as? String
         if state == nil || !SPOTIFY_KNOWN_STATES.contains(state!) {
             NSLog("wallpaper-overlay: unexpected Spotify Player State: \(String(describing: userInfo["Player State"]))")
@@ -164,6 +169,9 @@ final class SpotifyWatcher {
         }
         let script = nowPlayingScript
         let runScript = runScript
+        // Built here on the main actor and only ever called there; the script
+        // queue below is nonisolated and hands over just the Sendable snapshot
+        let deliver: @MainActor @Sendable (SpotifySnapshot?) -> Void = { completion($0) }
         scriptQueue.async {
             let result = runScript(script)
             let info = result.output.flatMap(parseNowPlaying)
@@ -172,7 +180,8 @@ final class SpotifyWatcher {
                 NSLog("wallpaper-overlay: couldn't read %@'s current track (AppleScript error %@): %@",
                       SPOTIFY_DISPLAY_NAME, number, result.error?.description ?? "no output")
             }
-            DispatchQueue.main.async { completion(info.map(SpotifyWatcher.parse)) }
+            let snapshot = info.map(SpotifyWatcher.parse)
+            DispatchQueue.main.async { deliver(snapshot) }
         }
     }
 
@@ -181,8 +190,9 @@ final class SpotifyWatcher {
     }
 }
 
-// Locale-safe: "12,5", "12.5", "1.234,5" and "1,234.5" all parse; nil for junk
-func parseLocaleNumber(_ text: String) -> Double? {
+// Locale-safe: "12,5", "12.5", "1.234,5" and "1,234.5" all parse; nil for junk.
+// Nonisolated: runs on the script queue.
+nonisolated func parseLocaleNumber(_ text: String) -> Double? {
     var cleaned = text.trimmingCharacters(in: .whitespaces)
     let lastComma = cleaned.lastIndex(of: ",")
     let lastDot = cleaned.lastIndex(of: ".")
@@ -206,7 +216,7 @@ func parseLocaleNumber(_ text: String) -> Double? {
 // Shaped like Spotify's own notification userInfo so SpotifyWatcher.parse accepts it.
 // A missing or unreadable number is left out rather than guessed as 0, since a
 // made-up position would resync the lyrics to the start of the song.
-func parseNowPlaying(_ output: String) -> [AnyHashable: Any]? {
+nonisolated func parseNowPlaying(_ output: String) -> [AnyHashable: Any]? {
     // Only the tail is trimmed: a leading blank line is an empty state field
     var body = Substring(output)
     while let last = body.last, last.isNewline { body = body.dropLast() }
@@ -230,6 +240,6 @@ func parseNowPlaying(_ output: String) -> [AnyHashable: Any]? {
     return info
 }
 
-private extension Double {
+nonisolated private extension Double {
     var nonNegativeFinite: Double? { isFinite && self >= 0 ? self : nil }
 }

@@ -20,8 +20,9 @@ func settle(_ tap: SpotifyAudioTap) {
     done.wait()
 }
 
-// Spotify's distributed notification center, counting what the session attaches and detaches
-final class CountingCenter: NotificationCenter, @unchecked Sendable {
+// Spotify's distributed notification center, counting what the session attaches and detaches.
+// Nonisolated like the NotificationCenter it overrides; only used from main here.
+nonisolated final class CountingCenter: NotificationCenter, @unchecked Sendable {
     var added = 0
     var removed = 0
     override func addObserver(forName name: NSNotification.Name?, object obj: Any?, queue: OperationQueue?,
@@ -36,7 +37,7 @@ final class CountingCenter: NotificationCenter, @unchecked Sendable {
 }
 
 // Shared between the main thread and the script queue
-final class Flag: @unchecked Sendable {
+nonisolated final class Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Bool
     init(_ value: Bool) { stored = value }
@@ -70,6 +71,47 @@ func scriptOutput(_ state: String, _ track: SpotifyTrack, position: Double) -> S
         .joined(separator: "\n")
 }
 
+nonisolated final class BuildCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return n }
+    func bump() { lock.lock(); n += 1; lock.unlock() }
+}
+
+// The canned AppleScript runner's state. The runner runs on the script queue,
+// so this is nonisolated and lock-protected; the harness forwards to it.
+nonisolated final class ScriptStub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var runs = 0
+    private var output: String?
+    private var gates = false
+    private var quits = false
+    // Stops the launch query inside the script runner until opened
+    let launchGate = DispatchSemaphore(value: 0)
+
+    var scriptRuns: Int { lock.lock(); defer { lock.unlock() }; return runs }
+    var launchOutput: String? {
+        get { lock.lock(); defer { lock.unlock() }; return output }
+        set { lock.lock(); output = newValue; lock.unlock() }
+    }
+    var gatesLaunchQuery: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return gates }
+        set { lock.lock(); gates = newValue; lock.unlock() }
+    }
+    var quitsDuringQuery: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return quits }
+        set { lock.lock(); quits = newValue; lock.unlock() }
+    }
+
+    // Script queue: one launch query
+    func run(appRunning: Flag) -> (output: String?, error: NSDictionary?) {
+        lock.lock(); runs += 1; lock.unlock()
+        if gatesLaunchQuery { launchGate.wait() }
+        if quitsDuringQuery { appRunning.value = false }
+        return (launchOutput, nil)
+    }
+}
+
 // One session plus everything it reported, wired the way OverlayController wires it.
 // Spotify is faked at the lowest level: its notification center, the AppleScript
 // runner, the app-running check, the scheduler and the tap build.
@@ -78,39 +120,52 @@ final class Harness {
     let workspaceCenter: NotificationCenter
     let tap: SpotifyAudioTap
     let appRunning = Flag(true)
+    // How often the stubbed tap build ran (on the tap's control queue)
+    let builds = BuildCounter()
     var session: MusicSession!
     var scheduled: [(delay: TimeInterval, work: DispatchWorkItem)] = []
     var runningQueries: [String] = []
-    var scriptRuns = 0
+    let script = ScriptStub()
+    var scriptRuns: Int { script.scriptRuns }
     var events: [String] = []
     var tracks: [SpotifyTrack] = []
     var positionAtTrack: SpotifyPositionStamp?
     // What the launch query prints; nil means no readable answer
-    var launchOutput: String?
+    var launchOutput: String? {
+        get { script.launchOutput }
+        set { script.launchOutput = newValue }
+    }
     // Stops the launch query inside the script runner until opened
-    let launchGate = DispatchSemaphore(value: 0)
-    var gatesLaunchQuery = false
+    var launchGate: DispatchSemaphore { script.launchGate }
+    var gatesLaunchQuery: Bool {
+        get { script.gatesLaunchQuery }
+        set { script.gatesLaunchQuery = newValue }
+    }
     // Flipped to "quit" by the launch query itself, as if Spotify closed while it ran
-    var quitsDuringQuery = false
+    var quitsDuringQuery: Bool {
+        get { script.quitsDuringQuery }
+        set { script.quitsDuringQuery = newValue }
+    }
 
-    init(buildFails: Bool = false, workspaceCenter: NotificationCenter = NotificationCenter()) {
+    // The dev/testing switches are passed explicitly so the test never depends on the environment
+    init(buildFails: Bool = false, workspaceCenter: NotificationCenter = NotificationCenter(),
+         isAudioTapEnabled: Bool = true, isScriptingEnabled: Bool = true) {
         self.workspaceCenter = workspaceCenter
+        let builds = self.builds
         let tap = SpotifyAudioTap(buildOverride: {
+            builds.bump()
             if buildFails { throw NSError(domain: "test", code: 1) }
         })
         self.tap = tap
         session = MusicSession(
             notificationCenter: center,
-            runScript: { [unowned self] _ in
-                self.scriptRuns += 1
-                if self.gatesLaunchQuery { self.launchGate.wait() }
-                if self.quitsDuringQuery { self.appRunning.value = false }
-                return (self.launchOutput, nil)
-            },
+            runScript: { [script, appRunning] _ in script.run(appRunning: appRunning) },
             makeTap: { tap },
             schedule: { [unowned self] delay, work in self.scheduled.append((delay, work)) },
             isAppRunning: { [unowned self] id in self.runningQueries.append(id); return self.appRunning.value },
-            workspaceCenter: workspaceCenter)
+            workspaceCenter: workspaceCenter,
+            isAudioTapEnabled: isAudioTapEnabled,
+            isScriptingEnabled: isScriptingEnabled)
         session.onTrack = { [unowned self] track in
             self.events.append("track")
             self.tracks.append(track)
@@ -282,6 +337,29 @@ shortLived?.start()
 let removedBefore = counted.center.removed
 shortLived = nil
 check("releasing the session stops its watcher", shortLived == nil && counted.center.removed == removedBefore + 1)
+
+// MARK: dev/testing switches
+check("dev switch is on only for exactly \"1\"",
+      isDevSwitchOn("X", env: ["X": "1"]) && !isDevSwitchOn("X", env: ["X": "0"])
+      && !isDevSwitchOn("X", env: ["X": "true"]) && !isDevSwitchOn("X", env: [:]))
+let built = Harness()
+built.session.start()
+settle(built.tap)
+check("tap enabled: start builds it once", built.builds.count == 1 && built.tap.isHealthy)
+let noTap = Harness(isAudioTapEnabled: false)
+noTap.session.start()
+noTap.broadcast("Playing", song("devtap"), position: 1)
+settle(noTap.tap)
+check("tap disabled: never built, even while playing", noTap.builds.count == 0 && !noTap.tap.isHealthy)
+check("tap disabled: no levels, so the glow follows play state", noTap.session.audioLevels() == nil)
+check("tap disabled: tracks still flow", noTap.tracks.map(\.id) == [song("devtap").id])
+let noScript = Harness(isScriptingEnabled: false)
+noScript.launchOutput = launchSnapshotOutput
+noScript.session.start()
+spin(seconds: 0.1)
+check("scripting disabled: no launch query, nothing applied", noScript.scriptRuns == 0 && noScript.tracks.isEmpty)
+noScript.broadcast("Playing", song("devscript"), position: 2)
+check("scripting disabled: notifications still sync", noScript.tracks.map(\.id) == [song("devscript").id])
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

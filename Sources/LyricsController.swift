@@ -135,7 +135,10 @@ final class LyricsController {
 
     private func startTicking() {
         guard ticker == nil else { return }
-        let timer = Timer(timeInterval: LYRICS_TICK_INTERVAL, repeats: true) { [weak self] _ in self?.tick() }
+        // Scheduled on the main run loop, so the block really runs on the main actor
+        let timer = Timer(timeInterval: LYRICS_TICK_INTERVAL, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
         RunLoop.main.add(timer, forMode: .common)
         ticker = timer
         tick()

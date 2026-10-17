@@ -25,7 +25,7 @@ struct OverlayConfig {
         return text.filter { $0 == "." }.count <= 1
     }
 
-    static func isInstalledFont(_ postScriptName: String) -> Bool {
+    nonisolated static func isInstalledFont(_ postScriptName: String) -> Bool {
         NSFont(name: postScriptName, size: 12) != nil
     }
 

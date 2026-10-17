@@ -4,20 +4,21 @@
 // Pure and allocation-free so it can run on the real-time audio thread.
 import Foundation
 
-let BASS_CUTOFF_HZ: Float = 150
-let LEVEL_ATTACK_SECONDS: Float = 0.02
-let LEVEL_RELEASE_SECONDS: Float = 0.25
-let BASS_AVERAGE_SECONDS: Float = 1.0
-let BEAT_RATIO: Float = 1.45          // bass must exceed its average by this factor
-let BEAT_FLOOR: Float = 0.02          // ...and be at least this loud
-let BEAT_REFRACTORY: CFTimeInterval = 0.28  // ignore re-triggers faster than ~214 BPM
-let SILENCE_FLOOR: Float = 0.002
-let TEMPO_BEAT_HISTORY = 9                  // beats kept; tempo from the median of their gaps
-let TEMPO_MIN_BPM: Double = 60              // estimates outside this range are halved/doubled
-let TEMPO_MAX_BPM: Double = 180
-let TEMPO_MAX_GAP: CFTimeInterval = 2       // a longer silence or beatless stretch forgets the tempo
+nonisolated let BASS_CUTOFF_HZ: Float = 150
+nonisolated let LEVEL_ATTACK_SECONDS: Float = 0.02
+nonisolated let LEVEL_RELEASE_SECONDS: Float = 0.25
+nonisolated let BASS_AVERAGE_SECONDS: Float = 1.0
+nonisolated let BEAT_RATIO: Float = 1.45          // bass must exceed its average by this factor
+nonisolated let BEAT_FLOOR: Float = 0.02          // ...and be at least this loud
+nonisolated let BEAT_REFRACTORY: CFTimeInterval = 0.28  // ignore re-triggers faster than ~214 BPM
+nonisolated let SILENCE_FLOOR: Float = 0.002
+nonisolated let TEMPO_BEAT_HISTORY = 9                  // beats kept; tempo from the median of their gaps
+nonisolated let TEMPO_MIN_BPM: Double = 60              // estimates outside this range are halved/doubled
+nonisolated let TEMPO_MAX_BPM: Double = 180
+nonisolated let TEMPO_MAX_GAP: CFTimeInterval = 2       // a longer silence or beatless stretch forgets the tempo
 
-struct AudioLevels {
+// Nonisolated: written on the audio IO queue, read by the render loop
+nonisolated struct AudioLevels: Sendable {
     var level: Float = 0                 // smoothed loudness, 0..~1
     var bass: Float = 0                  // smoothed bass loudness
     var lastBeat: CFTimeInterval = -.infinity   // CACurrentMediaTime of the last beat
@@ -25,7 +26,9 @@ struct AudioLevels {
     var bpm: Double = 0                  // estimated tempo; 0 until a few beats are heard
 }
 
-final class AudioAnalyzer {
+// Nonisolated: `process` runs on Core Audio's IO queue. Deliberately not Sendable:
+// each instance belongs to one IO block and is only used on that block's queue.
+nonisolated final class AudioAnalyzer {
     private let sampleRate: Float
     private let lowpassAlpha: Float
     private var lowpass: Float = 0

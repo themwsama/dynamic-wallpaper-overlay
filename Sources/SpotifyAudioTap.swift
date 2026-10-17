@@ -12,43 +12,50 @@ import QuartzCore
 import os
 
 // A device switch fires several property changes in a burst; rebuild once after it settles
-let TAP_REBUILD_DELAY: TimeInterval = 0.3
+nonisolated let TAP_REBUILD_DELAY: TimeInterval = 0.3
 // A tap that failed to build is retried when playback resumes, but not more often than this
-let TAP_RETRY_MIN_INTERVAL: TimeInterval = 30
-let AUDIO_CONTROL_QUEUE_LABEL = "wallpaper-overlay.audio-control"
-let TAP_OUTPUT_DEVICE_SELECTORS: [AudioObjectPropertySelector] = [
+nonisolated let TAP_RETRY_MIN_INTERVAL: TimeInterval = 30
+nonisolated let AUDIO_CONTROL_QUEUE_LABEL = "wallpaper-overlay.audio-control"
+nonisolated let TAP_OUTPUT_DEVICE_SELECTORS: [AudioObjectPropertySelector] = [
     kAudioHardwarePropertyDefaultSystemOutputDevice,
     kAudioHardwarePropertyDefaultOutputDevice,
 ]
 
-private struct TapError: Error, CustomStringConvertible {
+// Isolation: this whole file is explicitly `nonisolated`. The build uses
+// `-default-isolation MainActor`, and anything left to inherit it would carry a
+// main-actor check into closures Core Audio calls on its own threads (the IO
+// block on `ioQueue`, the device listener and the build on `control`); Swift 6
+// traps when such a closure runs off main.
+
+nonisolated private struct TapError: Error, CustomStringConvertible {
     let step: String
     let status: OSStatus
     var description: String { "\(step) failed (OSStatus \(status))" }
 }
 
-private func check(_ status: OSStatus, _ step: String) throws {
+nonisolated private func check(_ status: OSStatus, _ step: String) throws {
     guard status == noErr else { throw TapError(step: step, status: status) }
 }
 
-private func logIfFailed(_ status: OSStatus, _ step: String) {
+nonisolated private func logIfFailed(_ status: OSStatus, _ step: String) {
     guard status != noErr else { return }
     NSLog("wallpaper-overlay: audio tap: %@ failed (OSStatus %d)", step, status)
 }
 
-private func systemPropertyAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+nonisolated private func systemPropertyAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress(
         mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
 }
 
-// Calls `onChange` on `queue` when the default (or system) output device changes
-final class OutputDeviceListener {
+// Calls `onChange` on `queue` when the default (or system) output device changes.
+// Owned and driven by SpotifyAudioTap on its control queue only.
+nonisolated final class OutputDeviceListener {
     // Stored as the block type so removal passes the very same block object
     private let block: AudioObjectPropertyListenerBlock
     private let queue: DispatchQueue
     private var isInstalled = false
 
-    init(queue: DispatchQueue, onChange: @escaping () -> Void) {
+    init(queue: DispatchQueue, onChange: @escaping @Sendable () -> Void) {
         self.queue = queue
         block = { _, _ in onChange() }
     }
@@ -96,8 +103,10 @@ final class OutputDeviceListener {
 //
 // Deadlock rule: nothing on `control` ever waits for another thread (no sync to
 // main, no semaphores), which is why `stop()` may block on it with `sync`.
-// `@unchecked Sendable`: the control-queue state below is never touched elsewhere.
-final class SpotifyAudioTap: @unchecked Sendable {
+// `@unchecked Sendable`: the control-queue state below is never touched elsewhere,
+// and everything else is immutable or behind `OSAllocatedUnfairLock`.
+// `nonisolated`: no part of this class may inherit the main actor (see the file note).
+nonisolated final class SpotifyAudioTap: @unchecked Sendable {
     private struct Status {
         var isHealthy = false
         var isSuspended = false  // what the owner asked for; survives rebuilds
@@ -111,9 +120,9 @@ final class SpotifyAudioTap: @unchecked Sendable {
     private let bundleID = SPOTIFY_BUNDLE_ID
     private let appName = SPOTIFY_DISPLAY_NAME
     private let tapName: String
-    private let now: () -> CFTimeInterval
+    private let now: @Sendable () -> CFTimeInterval
     // Replaces the Core Audio build steps; lets tests drive the queue logic without a real tap
-    private let buildOverride: (() throws -> Void)?
+    private let buildOverride: (@Sendable () throws -> Void)?
 
     // Control-queue state: only touched from `control`
     private var tapID = AudioObjectID(kAudioObjectUnknown)
@@ -125,8 +134,8 @@ final class SpotifyAudioTap: @unchecked Sendable {
     private var deviceListener: OutputDeviceListener?
     private var rebuildWork: DispatchWorkItem?
 
-    init(now: @escaping () -> CFTimeInterval = CACurrentMediaTime,
-         buildOverride: (() throws -> Void)? = nil) {
+    init(now: @escaping @Sendable () -> CFTimeInterval = { CACurrentMediaTime() },
+         buildOverride: (@Sendable () throws -> Void)? = nil) {
         tapName = "Wallpaper Overlay \(appName) glow"
         self.now = now
         self.buildOverride = buildOverride
@@ -348,9 +357,21 @@ final class SpotifyAudioTap: @unchecked Sendable {
             throw TapError(step: "tap format is not float PCM", status: -1)
         }
         let analyzer = AudioAnalyzer(sampleRate: Float(format.mSampleRate))
-        let formatChannels = max(1, Int(format.mChannelsPerFrame))
-        let shared = self.shared
-        try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, ioQueue) { _, input, inputTime, _, _ in
+        let block = Self.makeIOBlock(
+            analyzer: analyzer, formatChannels: Int(format.mChannelsPerFrame), levels: shared)
+        try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, ioQueue, block),
+                  "AudioDeviceCreateIOProcIDWithBlock")
+    }
+
+    // The exact block handed to Core Audio, which calls it on `ioQueue`. Static and
+    // nonisolated so it can never pick up main-actor isolation (Swift 6 would trap
+    // the first time Core Audio called it off main), and internal so a test can call
+    // it from a background queue. Real-time safe: no allocation, no AppKit, only the
+    // analyzer it owns and one unfair lock.
+    static func makeIOBlock(analyzer: AudioAnalyzer, formatChannels: Int,
+                            levels shared: OSAllocatedUnfairLock<AudioLevels>) -> AudioDeviceIOBlock {
+        let formatChannels = max(1, formatChannels)
+        return { _, input, inputTime, _, _ in
             let playTime = hostMediaTime(of: inputTime.pointee)
             for buffer in UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input)) {
                 guard let data = buffer.mData else { continue }
@@ -362,7 +383,7 @@ final class SpotifyAudioTap: @unchecked Sendable {
             }
             let levels = analyzer.levels
             shared.withLock { $0 = levels }
-        }, "AudioDeviceCreateIOProcIDWithBlock")
+        }
     }
 
     private func tapFormat() throws -> AudioStreamBasicDescription {
@@ -389,8 +410,8 @@ final class SpotifyAudioTap: @unchecked Sendable {
 }
 
 // Host time of the buffer in CACurrentMediaTime's timebase, so the renderer can
-// compare. A free function: called on the IO thread, so it must stay unisolated.
-private func hostMediaTime(of timeStamp: AudioTimeStamp) -> CFTimeInterval {
+// compare. A free function: called on the IO thread, so it must stay nonisolated.
+nonisolated private func hostMediaTime(of timeStamp: AudioTimeStamp) -> CFTimeInterval {
     guard timeStamp.mFlags.contains(.hostTimeValid) else { return CACurrentMediaTime() }
     return CFTimeInterval(AudioConvertHostTimeToNanos(timeStamp.mHostTime)) / 1_000_000_000
 }

@@ -14,8 +14,9 @@ let PLAYBACK_MAX_FAILURES = 3
 let APPLESCRIPT_NOT_AUTHORIZED = -1743
 let APPLESCRIPT_APP_NOT_RUNNING = -600
 
-// Blocking position query for PlaybackClock's slow poll
-protocol SpotifyPositionSource {
+// Blocking position query for PlaybackClock's slow poll. Queried on `queue`, so
+// conformers are nonisolated and Sendable (state confined to that queue).
+nonisolated protocol SpotifyPositionSource: AnyObject, Sendable {
     /// The serial queue every query must run on (scripting APIs aren't thread-safe).
     var queue: DispatchQueue { get }
     /// Blocking; nil when unavailable.
@@ -25,16 +26,18 @@ protocol SpotifyPositionSource {
     var lastErrorNumber: Int? { get }
 }
 
-extension SpotifyPositionSource {
+nonisolated extension SpotifyPositionSource {
     var lastErrorNumber: Int? { nil }
 }
 
-func isApplicationRunning(_ bundleID: String) -> Bool {
+// Nonisolated: the position poll asks this on the script queue
+nonisolated func isApplicationRunning(_ bundleID: String) -> Bool {
     !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
 }
 
-// Runs a one-line "player position" script against Spotify
-final class AppleScriptPositionSource: SpotifyPositionSource {
+// Runs a one-line "player position" script against Spotify.
+// `@unchecked Sendable`: the mutable state is only touched on `queue`.
+nonisolated final class AppleScriptPositionSource: SpotifyPositionSource, @unchecked Sendable {
     let queue: DispatchQueue
     private let source: String
     // NSAppleScript isn't thread-safe: only ever called on `queue`
@@ -62,7 +65,7 @@ final class PlaybackClock {
     private let appName = "Spotify"
     private let source: SpotifyPositionSource
     private let now: () -> CFTimeInterval
-    private let isAppRunning: () -> Bool
+    private let isAppRunning: @Sendable () -> Bool
     private let log: (String) -> Void
 
     // All state below is main-thread only
@@ -88,7 +91,7 @@ final class PlaybackClock {
         bundleID: String,
         source: SpotifyPositionSource,
         now: @escaping () -> CFTimeInterval = CACurrentMediaTime,
-        isAppRunning: (() -> Bool)? = nil,
+        isAppRunning: (@Sendable () -> Bool)? = nil,
         log: @escaping (String) -> Void = { NSLog("%@", $0) }
     ) {
         self.source = source
@@ -127,20 +130,28 @@ final class PlaybackClock {
 
     // Main thread. Queries on the source's script queue, applies back on main.
     // `completion` runs on main once the result was applied or dropped.
+    // The queue work is nonisolated: it only touches the Sendable source and
+    // running check captured here, never main-actor state, and hands its result
+    // to `finish`, which is built here and only ever runs on the main actor.
     func pollOnce(completion: (() -> Void)? = nil) {
         let startEpoch = epoch
         isPollInFlight = true
-        source.queue.async { [weak self] in
+        let source = self.source
+        let isAppRunning = self.isAppRunning
+        let finish: @MainActor @Sendable (_ isRunning: Bool, _ polled: TimeInterval?, _ errorNumber: Int?) -> Void = {
+            [weak self] isRunning, polled, errorNumber in
             guard let self else { return }
+            self.isPollInFlight = false
+            if isRunning { self.apply(polled: polled, errorNumber: errorNumber, epoch: startEpoch) }
+            completion?()
+        }
+        source.queue.async { [weak self] in
+            guard self != nil else { return }
             // Querying Spotify while it's closed would launch it
-            let isRunning = self.isAppRunning()
-            let polled = isRunning ? self.source.currentPosition() : nil
-            let errorNumber = polled == nil ? self.source.lastErrorNumber : nil
-            DispatchQueue.main.async {
-                self.isPollInFlight = false
-                if isRunning { self.apply(polled: polled, errorNumber: errorNumber, epoch: startEpoch) }
-                completion?()
-            }
+            let isRunning = isAppRunning()
+            let polled = isRunning ? source.currentPosition() : nil
+            let errorNumber = polled == nil ? source.lastErrorNumber : nil
+            DispatchQueue.main.async { finish(isRunning, polled, errorNumber) }
         }
     }
 
@@ -218,8 +229,11 @@ final class PlaybackClock {
         let newTimer = DispatchSource.makeTimerSource(queue: .main)
         newTimer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
         newTimer.setEventHandler { [weak self] in
-            guard let self, !self.isPollInFlight else { return }
-            self.pollOnce()
+            // The timer's queue is .main, so this really is on the main actor
+            MainActor.assumeIsolated {
+                guard let self, !self.isPollInFlight else { return }
+                self.pollOnce()
+            }
         }
         newTimer.resume()
         timer = newTimer

@@ -16,6 +16,7 @@ func resolveLogURL(env: [String: String] = ProcessInfo.processInfo.environment) 
     return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
 }
 
+// Main actor (the build default): runs on the main run loop, never off main
 enum Housekeeping {
     static let cacheDirectory = OVERLAY_DIR.appendingPathComponent("lyrics-cache", isDirectory: true)
     static let logURL = resolveLogURL()
@@ -77,7 +78,10 @@ enum Housekeeping {
 
     static func schedule() -> Timer {
         runAll()
-        let timer = Timer(timeInterval: HOUSEKEEPING_INTERVAL, repeats: true) { _ in runAll() }
+        // Added to the main run loop, so the block really runs on the main actor
+        let timer = Timer(timeInterval: HOUSEKEEPING_INTERVAL, repeats: true) { _ in
+            MainActor.assumeIsolated { runAll() }
+        }
         RunLoop.main.add(timer, forMode: .common)
         return timer
     }

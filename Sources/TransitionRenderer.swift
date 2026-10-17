@@ -88,7 +88,10 @@ final class BackdropView: MTKView {
         owner?.updateDrawableSize(of: self)
         occlusionObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
-        ) { [weak self] _ in self?.syncOcclusion() }
+        ) { [weak self] _ in
+            // Delivered on `.main`, so this really is on the main actor
+            MainActor.assumeIsolated { self?.syncOcclusion() }
+        }
         // A window created under a full-screen app may never post a change, so seed
         // the state now and again once the window has been ordered front
         syncOcclusion()
@@ -110,7 +113,8 @@ final class BackdropView: MTKView {
         owner?.updateDrawableSize(of: self)
     }
 
-    deinit {
+    // Isolated: the observer token is main-actor state (views are released on main)
+    isolated deinit {
         occlusionObserver.map(NotificationCenter.default.removeObserver)
     }
 }
@@ -158,8 +162,10 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
             name: .NSProcessInfoPowerStateDidChange, object: nil)
     }
 
-    // Posted on a background queue when macOS Low Power Mode turns on or off
-    @objc private func powerStateChanged() {
+    // Posted on a background queue when macOS Low Power Mode turns on or off.
+    // Nonisolated: Swift 6 checks the actor in @objc entry points, so a main-actor
+    // method would trap when the notification arrives off main; it hops instead.
+    @objc nonisolated private func powerStateChanged() {
         DispatchQueue.main.async {
             self.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
             self.updateFramesPerSecond()
@@ -331,8 +337,10 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
         encoder.setFragmentTexture(atlas, index: 1)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
-        // The GPU reads these planes after we return; a pause or the next frame may drop our own references
-        let held = video.held
+        // The GPU reads these planes after we return; a pause or the next frame may drop our own references.
+        // nonisolated(unsafe): the completion handler (Metal's thread) only keeps the
+        // array alive and never touches its contents
+        nonisolated(unsafe) let held = video.held
         commands.addCompletedHandler { _ in withExtendedLifetime(held) {} }
         commands.present(drawable)
         commands.commit()

@@ -6,8 +6,10 @@ func check(_ cond: Bool, _ name: String) {
 }
 
 // MARK: stub
-final class Stub: URLProtocol {
-    nonisolated(unsafe) static var handler: ((URLRequest) -> (Int, Data)?)?  // nil = network error
+// Runs on URLSession's threads, so nonisolated; the handler is @Sendable so the
+// closures the tests pass are never main-actor isolated
+nonisolated final class Stub: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data)?)?  // nil = network error
     nonisolated(unsafe) static var requests: [URLRequest] = []
     static let lock = NSLock()
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -24,13 +26,19 @@ final class Stub: URLProtocol {
     }
     override func stopLoading() {}
 }
-func resetStub(_ h: @escaping (URLRequest) -> (Int, Data)?) { Stub.lock.lock(); Stub.requests = []; Stub.lock.unlock(); Stub.handler = h }
+// Request counter for stub handlers, which run on URLSession's threads
+nonisolated final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func next() -> Int { lock.lock(); defer { lock.unlock() }; value += 1; return value }
+}
+func resetStub(_ h: @escaping @Sendable (URLRequest) -> (Int, Data)?) { Stub.lock.lock(); Stub.requests = []; Stub.lock.unlock(); Stub.handler = h }
 func reqCount() -> Int { Stub.lock.lock(); defer { Stub.lock.unlock() }; return Stub.requests.count }
 let cfg = URLSessionConfiguration.ephemeral
 cfg.protocolClasses = [Stub.self]
 let session = URLSession(configuration: cfg)
 
-func json(_ o: Any) -> Data { try! JSONSerialization.data(withJSONObject: o) }
+nonisolated func json(_ o: Any) -> Data { try! JSONSerialization.data(withJSONObject: o) }
 func tmpDir() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("lyrics-provider-tests-\(UUID().uuidString)") }
 func spin(_ cond: () -> Bool) { let end = Date().addingTimeInterval(5); while !cond() && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) } }
 
@@ -196,7 +204,7 @@ do {
 
 
 // MARK: fallthrough, retry, versioning
-func isGet(_ r: URLRequest) -> Bool { r.url!.path.hasSuffix("/get") }
+nonisolated func isGet(_ r: URLRequest) -> Bool { r.url!.path.hasSuffix("/get") }
 func cacheFiles(_ d: URL) -> [String] { (try? FileManager.default.contentsOfDirectory(atPath: d.path)) ?? [] }
 func fetchArtist(_ p: LyricsProvider, artist: String, duration: TimeInterval?) -> TimedLyrics? {
     var done = false; var out: TimedLyrics?
@@ -235,8 +243,8 @@ do {
     check(fetchArtist(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), artist: "Nobody Matches", duration: 100) == nil, "no artist match and wrong length: rejected")
 }
 do {
-    var n = 0
-    resetStub { r in n += 1; return n == 1 ? (503, Data()) : (200, json(["syncedLyrics": lrcA])) }
+    let n = Counter()
+    resetStub { r in n.next() == 1 ? (503, Data()) : (200, json(["syncedLyrics": lrcA])) }
     check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) != nil && reqCount() == 2, "503 then 200 retried")
 }
 do {
@@ -252,8 +260,8 @@ do {
     check(reqCount() == 1, "400 not retried")
 }
 do {
-    var n = 0
-    resetStub { _ in n += 1; return n == 1 ? nil : (200, json(["syncedLyrics": lrcA])) }
+    let n = Counter()
+    resetStub { _ in n.next() == 1 ? nil : (200, json(["syncedLyrics": lrcA])) }
     check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) != nil && reqCount() == 2, "URL error retried")
     // search retries too; get plain-only then search 503 x3 -> no cache
     resetStub { r in isGet(r) ? (200, json(["plainLyrics": "p"])) : (503, Data()) }
@@ -282,7 +290,8 @@ do {
 func searchResult(title: String = "River & Moon", artist: String = "Paper Lanterns", wantTitle: String = "River & Moon",
                   wantArtist: String = "Paper Lanterns", duration: TimeInterval? = 200, results: [[String: Any]],
                   dir: URL = tmpDir(), id: String = "sv") -> LookupOutcome? {
-    resetStub { r in isGet(r) ? (404, Data()) : (200, json(results)) }
+    let body = json(results)
+    resetStub { r in isGet(r) ? (404, Data()) : (200, body) }
     let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])
     var out: LookupOutcome?
     p.lyrics(trackID: id, artist: wantArtist, title: wantTitle, album: "al", duration: duration) { out = $0 }
@@ -291,7 +300,7 @@ func searchResult(title: String = "River & Moon", artist: String = "Paper Lanter
 }
 func isNone(_ o: LookupOutcome?) -> Bool { if case .none? = o { return true }; return false }
 func text(_ o: LookupOutcome?) -> String? { lyricsOf(o ?? .failed)?.lines.first?.text }
-func hit(_ name: String, _ artist: String, _ duration: Double, _ lyric: String) -> [String: Any] {
+nonisolated func hit(_ name: String, _ artist: String, _ duration: Double, _ lyric: String) -> [String: Any] {
     ["trackName": name, "artistName": artist, "duration": duration, "syncedLyrics": "[00:01.00] \(lyric)"]
 }
 do {
@@ -373,7 +382,7 @@ do {
 
 // MARK: plain-lyrics fallback
 let plainText = "invented first line\ninvented second line\ninvented third line"
-func plainHit(_ name: String = "River & Moon", _ artist: String = "Paper Lanterns", _ duration: Double = 200,
+nonisolated func plainHit(_ name: String = "River & Moon", _ artist: String = "Paper Lanterns", _ duration: Double = 200,
               plain: String = plainText, instrumental: Bool = false) -> [String: Any] {
     ["trackName": name, "artistName": artist, "duration": duration, "plainLyrics": plain, "instrumental": instrumental]
 }

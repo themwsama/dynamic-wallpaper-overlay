@@ -1,5 +1,7 @@
 # Tests
 
+Every `run.sh` compiles with the app's Swift flags from `scripts/swift-flags.sh` (Swift 6 language mode, main-actor default isolation), so test code that runs off main (URLProtocol stubs, script runners, position sources) must be `nonisolated` and `Sendable`, as in the app.
+
 Each suite is a standalone assert-style runner (`PASS`/`FAIL` lines, exit 1 on failure). Run one with `Tests/<Name>/run.sh`; each compiles only the `Sources/*.swift` files it needs into a temp dir. Tests use temp dirs or UserDefaults suites, never `~/.config`.
 
 Run them all with `scripts/run-tests.sh` (one PASS/FAIL line per suite; add `-v` or `--verbose` for full output of every suite).
@@ -10,7 +12,7 @@ Run them all with `scripts/run-tests.sh` (one PASS/FAIL line per suite; add `-v`
 - `GenreResolverTests`: genre lookup, mapping, caching and fallback order with stubbed network.
 - `HousekeepingTests`: cache pruning by age/count and in-place log trimming.
 - `LyricsProviderTests`: LRC parsing, LRCLIB requests, retries, caching and romaji with a stubbed URLSession (invented lyrics only).
-- `MusicSessionTests`: `MusicSession` driven by fake Spotify playback notifications posted to an injected `NotificationCenter`, with a canned AppleScript runner, app-running check and stubbed tap build: track/position/play-state callbacks, quit (reset and ended), the launch bootstrap (only when Spotify runs and no track is known yet), and the audio-tap grace suspend through an injected scheduler (no sleeping).
+- `MusicSessionTests`: `MusicSession` driven by fake Spotify playback notifications posted to an injected `NotificationCenter`, with a canned AppleScript runner, app-running check and stubbed tap build: track/position/play-state callbacks, quit (reset and ended), the launch bootstrap (only when Spotify runs and no track is known yet), the audio-tap grace suspend through an injected scheduler (no sleeping), and the dev/testing switches (`WALLPAPER_OVERLAY_NO_AUDIO_TAP`, `WALLPAPER_OVERLAY_NO_APPLESCRIPT`).
 - `LyricsViewTests`: karaoke sweep timing arithmetic for lyric rows (pure math, no rendering).
 - `PlaybackClockTests`: playback position interpolation, resync and poll backoff with a fake `SpotifyPositionSource`.
 - `SettingsTests`: persisted settings defaults and round-trips via a throwaway UserDefaults suite (UUID name; `run.sh` deletes the domain and its plist afterwards).

@@ -86,7 +86,8 @@ private struct LRCLibTrack: Decodable {
     let plainLyrics: String?
 }
 
-private enum HTTPResult {
+// Nonisolated and Sendable: built on the URLSession queue, consumed on main
+nonisolated private enum HTTPResult: Sendable {
     case ok(Data), notFound, failed
     case retryable  // 5xx, 429, timeouts and other transport errors
 }
@@ -510,21 +511,25 @@ final class LyricsProvider {
         var request = URLRequest(url: url)
         request.timeoutInterval = LYRICS_REQUEST_TIMEOUT
         request.setValue(LRCLIB_USER_AGENT, forHTTPHeaderField: "User-Agent")
+        // Built here on the main actor and only ever called there; the session's
+        // completion (its own queue) interprets the response and hops back with it
+        let deliver: @MainActor @Sendable (HTTPResult) -> Void = { [self] result in
+            guard case .retryable = result else { return completion(result) }
+            guard attempt < retryDelays.count else { return completion(.failed) }
+            NSLog("wallpaper-overlay: \(label) retry \(attempt + 1) in \(retryDelays[attempt])s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + retryDelays[attempt]) { [self] in
+                self.request(url, label: label, attempt: attempt + 1, completion: completion)
+            }
+        }
         session.dataTask(with: request) { data, response, error in
             let result = Self.interpret(data, response, error, label: label)
-            DispatchQueue.main.async { [self] in
-                guard case .retryable = result else { return completion(result) }
-                guard attempt < retryDelays.count else { return completion(.failed) }
-                NSLog("wallpaper-overlay: \(label) retry \(attempt + 1) in \(retryDelays[attempt])s")
-                DispatchQueue.main.asyncAfter(deadline: .now() + retryDelays[attempt]) { [self] in
-                    self.request(url, label: label, attempt: attempt + 1, completion: completion)
-                }
-            }
+            DispatchQueue.main.async { deliver(result) }
         }.resume()
     }
 
-    private static func interpret(_ data: Data?, _ response: URLResponse?, _ error: Error?,
-                                  label: String) -> HTTPResult {
+    // Nonisolated: runs on the URLSession delegate queue
+    nonisolated private static func interpret(_ data: Data?, _ response: URLResponse?, _ error: Error?,
+                                              label: String) -> HTTPResult {
         if let error {
             NSLog("wallpaper-overlay: \(label) request failed: \(error.localizedDescription)")
             return .retryable

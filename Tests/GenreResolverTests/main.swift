@@ -9,10 +9,12 @@ func check(_ ok: Bool, _ name: String) {
 
 // MARK: stub transport
 
-struct Recorded { let url: URL; let headers: [String: String]; let body: Data }
-struct Reply { let status: Int; let body: Data; static let fail = Reply(status: -1, body: Data()) }
+// The stub transport runs on URLSession's threads, so it and the fixture it
+// reads are nonisolated. Fixture knobs are only set on main between lookups.
+nonisolated struct Recorded: Sendable { let url: URL; let headers: [String: String]; let body: Data }
+nonisolated struct Reply: Sendable { let status: Int; let body: Data; static let fail = Reply(status: -1, body: Data()) }
 
-final class Fixture {
+nonisolated final class Fixture: @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [Recorded] = []
     var spotifyGenres: [String] = ["edm"]
@@ -54,9 +56,9 @@ final class Fixture {
         return Reply(status: 404, body: Data())
     }
 }
-let fixture = Fixture()
+nonisolated let fixture = Fixture()
 
-final class StubProtocol: URLProtocol {
+nonisolated final class StubProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
@@ -74,7 +76,7 @@ final class StubProtocol: URLProtocol {
         guard let url = request.url else { return }
         fixture.record(Recorded(url: url, headers: request.allHTTPHeaderFields ?? [:], body: readBody()))
         let reply = fixture.reply(to: url)
-        let respond = { [self] in
+        let respond: @Sendable () -> Void = { [self] in
             if reply.status < 0 { client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)); return }
             let resp = HTTPURLResponse(url: url, statusCode: reply.status, httpVersion: nil, headerFields: nil)!
             client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
@@ -96,7 +98,7 @@ let stubSession: URLSession = {
 let workDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("genretest-\(UUID().uuidString)")
 func freshCacheURL() -> URL { workDir.appendingPathComponent(UUID().uuidString).appendingPathComponent("genre-cache.json") }
 
-let fullCreds = GenreCredentials(spotifyClientID: "cid", spotifyClientSecret: "csecret", geminiAPIKey: "gkey")
+nonisolated let fullCreds = GenreCredentials(spotifyClientID: "cid", spotifyClientSecret: "csecret", geminiAPIKey: "gkey")
 let geminiOnly = GenreCredentials(spotifyClientID: nil, spotifyClientSecret: nil, geminiAPIKey: "gkey")
 let noCreds = GenreCredentials(spotifyClientID: nil, spotifyClientSecret: nil, geminiAPIKey: nil)
 
@@ -439,7 +441,8 @@ do {
 // MARK: 13. lazy credentials (keychain) only on first network need, off main
 
 do {
-    final class Loader {
+    // Called on the background credentials queue; lock-protected
+    nonisolated final class Loader: @unchecked Sendable {
         private let lock = NSLock()
         private var _calls = 0
         private var _offMain = true

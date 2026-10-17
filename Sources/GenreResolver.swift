@@ -17,7 +17,7 @@ let SPOTIFY_TOKEN_EXPIRY_MARGIN: TimeInterval = 60
 // After a lookup finds nothing, don't re-ask for this long (it still retries later)
 let GENRE_FAILURE_COOLDOWN: TimeInterval = 60
 let GENRE_PROMPT_FIELD_MAX = 200
-let GENRE_KEYCHAIN_SERVICE = "wallpaper-overlay"
+nonisolated let GENRE_KEYCHAIN_SERVICE = "wallpaper-overlay"
 // Bump when the cache file layout or key meaning changes; older files are ignored
 let GENRE_CACHE_VERSION = 2
 
@@ -91,7 +91,8 @@ private extension GenreBucket {
     }
 }
 
-struct GenreCredentials {
+// Nonisolated and Sendable: loaded from the Keychain on a background queue
+nonisolated struct GenreCredentials: Sendable {
     let spotifyClientID: String?
     let spotifyClientSecret: String?
     let geminiAPIKey: String?
@@ -168,7 +169,7 @@ private struct GeminiResponse: Decodable {
 final class GenreResolver {
     private let cacheURL: URL
     private let session: URLSession
-    private let loadCredentials: () -> GenreCredentials
+    private let loadCredentials: @Sendable () -> GenreCredentials
     private var credentials: GenreCredentials?
     private var credentialWaiters: [(GenreCredentials) -> Void]?  // non-nil while loading
     private var cache: [String: GenreBucket]
@@ -184,7 +185,7 @@ final class GenreResolver {
     // Keychain reads can block (and may prompt), so `credentials` runs only when a
     // lookup first needs a key, once, off the main thread. Cache hits and iTunes
     // answers never touch it.
-    init(cacheURL: URL, session: URLSession = .shared, credentials: @escaping () -> GenreCredentials) {
+    init(cacheURL: URL, session: URLSession = .shared, credentials: @escaping @Sendable () -> GenreCredentials) {
         self.cacheURL = cacheURL
         self.session = session
         self.loadCredentials = credentials
@@ -481,10 +482,13 @@ final class GenreResolver {
                          completion: @escaping (T?) -> Void) {
         var request = request
         request.timeoutInterval = GENRE_REQUEST_TIMEOUT
-        session.dataTask(with: request) { [self] data, response, error in
-            DispatchQueue.main.async { [self] in
-                completion(interpret(data, response, error, label: label, parse: parse))
-            }
+        // Built here on the main actor and only ever called there: the session's
+        // completion runs on its own queue and just hops back with the raw result
+        let deliver: @MainActor @Sendable (Data?, URLResponse?, (any Error)?) -> Void = { [self] data, response, error in
+            completion(interpret(data, response, error, label: label, parse: parse))
+        }
+        session.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async { deliver(data, response, error) }
         }.resume()
     }
 

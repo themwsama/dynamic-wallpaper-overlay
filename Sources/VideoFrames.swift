@@ -36,7 +36,9 @@ final class VideoFrameSource {
         }
         // A corrupt or unsupported file only fails after init; without this the
         // wallpaper would stay transparent with nothing in the log
-        statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+        // @Sendable, so nonisolated: KVO may fire on whichever thread changed the
+        // status, and a main-actor closure would trap there under Swift 6
+        statusObservation = item.observe(\.status, options: [.initial, .new]) { @Sendable [weak self] item, _ in
             guard item.status == .failed else { return }
             DispatchQueue.main.async { self?.reportFailure(item.error) }
         }
@@ -52,7 +54,8 @@ final class VideoFrameSource {
               error.map { "\($0.localizedDescription) (\($0))" } ?? "unknown error")
     }
 
-    deinit {
+    // Isolated: the observer tokens are main-actor state
+    isolated deinit {
         statusObservation?.invalidate()
         loopObserver.map(NotificationCenter.default.removeObserver)
     }

@@ -12,7 +12,8 @@ let queueKey = DispatchSpecificKey<Bool>()
 let scriptQueue = DispatchQueue(label: "test.script-queue")
 scriptQueue.setSpecific(key: queueKey, value: true)
 
-final class FakeSource: SpotifyPositionSource {
+// Queried on the script queue, so nonisolated; lock-protected
+nonisolated final class FakeSource: SpotifyPositionSource, @unchecked Sendable {
     let queue = scriptQueue
     private let lock = NSLock()
     private var value: TimeInterval?
@@ -37,11 +38,21 @@ func spin(_ cond: () -> Bool) {
 }
 
 var time: CFTimeInterval = 1000
-var running = true
+// Read by the running check on the script queue
+nonisolated final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool
+    init(_ value: Bool) { stored = value }
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+let running = LockedFlag(true)
 var logs: [String] = []
 let source = FakeSource()
 let clock = PlaybackClock(bundleID: "com.example.player", source: source,
-                          now: { time }, isAppRunning: { running }, log: { logs.append($0) })
+                          now: { time }, isAppRunning: { running.value }, log: { logs.append($0) })
 
 func poll(_ v: TimeInterval?, error: Int? = nil) {
     source.set(v, error: error)
@@ -87,10 +98,10 @@ time += 1
 check("plays on after sync", near(clock.position(), 2.0))
 
 let calls = source.calls
-running = false
+running.value = false
 poll(5)
 check("no query when the app is not running", source.calls == calls && near(clock.position(), 2.0))
-running = true
+running.value = true
 check("queries run on the source's script queue", source.calls > 0 && source.callsOffSharedQueue == 0)
 
 // Without an injected check, the clock asks NSWorkspace about its own bundle ID

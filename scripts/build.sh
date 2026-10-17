@@ -7,6 +7,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib.sh
 source "$REPO/scripts/lib.sh"
+# shellcheck source=swift-flags.sh
+source "$REPO/scripts/swift-flags.sh"
 env_path OUT_DIR "$DEFAULT_OUT_DIR"
 config_dir_init
 validate_bundle_id
@@ -64,7 +66,7 @@ trap cleanup EXIT
 NEW="$STAGE/$APP_NAME.app"
 mkdir -p "$NEW/Contents/MacOS" "$NEW/Contents/Resources"
 
-swiftc -O "$REPO"/Sources/*.swift -o "$NEW/Contents/MacOS/$EXE" || die "swiftc failed; existing app left untouched"
+swiftc -O "${SWIFT_FLAGS[@]}" "$REPO"/Sources/*.swift -o "$NEW/Contents/MacOS/$EXE" || die "swiftc failed; existing app left untouched"
 
 # Info.plist (plutil escapes values for us)
 INFO="$NEW/Contents/Info.plist"

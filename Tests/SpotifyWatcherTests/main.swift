@@ -145,17 +145,26 @@ RunLoop.main.run(until: Date().addingTimeInterval(0.05))
 check("stop detaches from the center", centerTracks.count == 1)
 
 // fetchNowPlaying: injected app-running check and script runner
+nonisolated final class Recorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String] = []
+    var all: [String] { lock.lock(); defer { lock.unlock() }; return items }
+    func append(_ item: String) { lock.lock(); items.append(item); lock.unlock() }
+}
 func fetch(running: Bool, output: String?, error: NSDictionary? = nil) -> (snapshot: SpotifySnapshot?, ran: [String], asked: [String]) {
-    var ran: [String] = []
+    // The runner runs on the script queue: record through a lock. The error
+    // dictionary is immutable, so handing it across is safe.
+    let ran = Recorder()
+    nonisolated(unsafe) let scriptError = error
     var asked: [String] = []
-    let f = SpotifyWatcher(runScript: { ran.append($0); return (output, error) },
+    let f = SpotifyWatcher(runScript: { ran.append($0); return (output, scriptError) },
                            isAppRunning: { asked.append($0); return running })
     var done = false
     var result: SpotifySnapshot?
     f.fetchNowPlaying { result = $0; done = true }
     let end = Date().addingTimeInterval(5)
     while !done && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.005)) }
-    return (result, ran, asked)
+    return (result, ran.all, asked)
 }
 let live = fetch(running: true, output: "playing\nspotify:track:f1\nN\nA\nB\n215000\n12.5")
 check("fetch parses the script output", live.snapshot?.isPlaying == true && live.snapshot?.track?.id == "spotify:track:f1"

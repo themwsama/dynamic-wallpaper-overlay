@@ -84,9 +84,12 @@ final class OverlayController: NSObject {
             self, selector: #selector(screenParametersChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
         let ticker = Timer(timeInterval: CLOCK_TICK_INTERVAL, repeats: true) { [weak self] _ in
-            guard let self, self.clock.isRunning else { return }
-            self.clock.tick()
-            self.refreshClocks()
+            // Scheduled on the main run loop below, so this really is on the main actor
+            MainActor.assumeIsolated {
+                guard let self, self.clock.isRunning else { return }
+                self.clock.tick()
+                self.refreshClocks()
+            }
         }
         RunLoop.main.add(ticker, forMode: .common)
         self.ticker = ticker
@@ -187,7 +190,9 @@ final class OverlayController: NSObject {
         glow?.isEnabled = settings.isMusicGlowEnabled
     }
 
-    @objc private func powerStateChanged() {
+    // Posted on a background queue. Nonisolated: Swift 6 checks the actor in @objc
+    // entry points, so a main-actor method would trap there; it hops to main instead.
+    @objc nonisolated private func powerStateChanged() {
         DispatchQueue.main.async { self.controlCenter.refresh() }
     }
 
@@ -212,8 +217,11 @@ final class OverlayController: NSObject {
             ctx.duration = CLOCK_FADE_DURATION
             window.animator().alphaValue = visible ? 1 : 0
         }, completionHandler: {
-            // Skip if the user toggled back while the fade was running
-            if !visible && !self.settings.isClockVisible { window.orderOut(nil) }
+            // AppKit runs animation completions on the main thread
+            MainActor.assumeIsolated {
+                // Skip if the user toggled back while the fade was running
+                if !visible && !self.settings.isClockVisible { window.orderOut(nil) }
+            }
         })
     }
 

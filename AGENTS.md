@@ -20,6 +20,10 @@ project fits together; `README.md` is the short human version.
 
 ## 1. Rules for agents (read first)
 
+- **Touching lyrics code?** Read [`docs/LYRICS_LESSONS.md`](docs/LYRICS_LESSONS.md)
+  first, and add an entry after every lyrics fix. It records each past
+  mistake, so you don't repeat them.
+
 - **Never commit or publish personal data.** User videos, generated wallpapers,
   `config.json`, caches (`lyrics-cache/`, `genre-cache.json`) and logs stay on
   the user's machine. `.gitignore` already excludes them; don't override it.
@@ -383,6 +387,14 @@ using invented text.
 - `UPPER_SNAKE_CASE` constants near the top of the file that uses them.
 - `final class`, small focused functions, early returns.
 - Comments explain *why*, not what.
+- Swift 6 with `-default-isolation MainActor` (flags in `scripts/swift-flags.sh`):
+  anything that runs off the main thread (the audio IO block, Core Audio
+  listeners, script queues, URLSession and KVO callbacks, notifications
+  posted on background queues) must be explicitly `nonisolated` /
+  `@Sendable`, or it traps at runtime.
+- Dev switches: `WALLPAPER_OVERLAY_NO_AUDIO_TAP=1` and
+  `WALLPAPER_OVERLAY_NO_APPLESCRIPT=1` let you test-launch without permission
+  prompts. `WALLPAPER_OVERLAY_TRACE_LYRICS=1` logs lyric display decisions.
 - Audio-thread code (`AudioAnalyzer.process`) must not allocate or lock.
 - `Uniforms` in `Transition.metal` and `TransitionUniforms` in Swift must match
   field for field (16-byte aligned `float4`s; stride 160). The app checks the

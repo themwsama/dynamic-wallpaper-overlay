@@ -157,7 +157,10 @@ final class ControlCenterPanel {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = PANEL_ANIMATION_DURATION * 0.7
             panel.animator().alphaValue = 0
-        }, completionHandler: { panel.orderOut(nil) })
+        }, completionHandler: {
+            // AppKit runs animation completions on the main thread
+            MainActor.assumeIsolated { panel.orderOut(nil) }
+        })
         onOpenChange?(false)
     }
 

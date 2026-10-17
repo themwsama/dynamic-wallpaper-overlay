@@ -28,15 +28,20 @@ final class VisibilityMonitor {
         observeOcclusion()
     }
 
-    deinit {
+    // Isolated: the observer tokens are main-actor state
+    isolated deinit {
         observers.forEach { center, token in center.removeObserver(token) }
     }
 
-    private func observe(_ center: NotificationCenter, _ name: Notification.Name, _ update: @escaping (VisibilityMonitor) -> Void) {
+    // Observers are delivered on `.main`, so their blocks really run on the main actor
+    private func observe(_ center: NotificationCenter, _ name: Notification.Name,
+                         _ update: @escaping @MainActor @Sendable (VisibilityMonitor) -> Void) {
         let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-            guard let self else { return }
-            update(self)
-            self.reevaluate()
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                update(self)
+                self.reevaluate()
+            }
         }
         observers.append((center, token))
     }
@@ -44,7 +49,7 @@ final class VisibilityMonitor {
     private func observeOcclusion() {
         let token = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.reevaluate() }
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.reevaluate() } }
         observers.append((NotificationCenter.default, token))
     }
 
