@@ -17,3 +17,6 @@ genre-cache.json
 # Tool state
 .DS_Store
 .impeccable/
+
+# Local agent worktrees and tool state
+.claude/
