@@ -149,7 +149,7 @@ do {
 }
 do {
     resetStub { _ in (200, json(["plainLyrics": "plain only", "instrumental": false])) }
-    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) == nil, "plain-only nil")
+    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) == nil, "plain-only get with an undecodable search nil")
     resetStub { _ in (200, json(["instrumental": true, "syncedLyrics": lrcA])) }
     check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) == nil, "instrumental nil")
 }
@@ -272,7 +272,7 @@ do {
 }
 do {
     // negative cache only after definitive search miss
-    resetStub { r in isGet(r) ? (200, json(["plainLyrics": "p"])) : (200, json([[String: Any]]())) }
+    resetStub { r in isGet(r) ? (404, Data()) : (200, json([[String: Any]]())) }
     let dir = tmpDir()
     check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && cacheFiles(dir).count == 1, "definitive miss writes negative")
 }
@@ -327,7 +327,140 @@ do {
     try! json(wrong).write(to: dir.appendingPathComponent(LyricsProvider.cacheFileName(for: "t1")))
     resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
     let l = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
-    check(LYRICS_CACHE_VERSION == 3 && l?.lines.first?.text == "paper lanterns drift over the river" && reqCount() == 1, "version 2 cache entry dropped")
+    check(LYRICS_CACHE_VERSION == 4 && l?.lines.first?.text == "paper lanterns drift over the river" && reqCount() == 1, "version 2 cache entry dropped")
+}
+
+// MARK: estimated timing
+let plain5 = "first invented line\nsecond invented line here\n\n  \nthird\nfourth invented lantern line goes on\nfifth"
+do {
+    let l = LyricsProvider.estimateTiming(plain: plain5, duration: 200)!
+    let intro = min(12.0, 200 * 0.08), outro = min(10.0, 200 * 0.06)
+    check(l.isEstimated && l.lines.count == 5 && l.lines.allSatisfy { $0.text != "" && $0.words == nil }, "estimate: flagged, empty lines dropped, no gap lines")
+    check(l.lines[0].start == intro, "estimate: first line starts at the intro offset (12s cap)")
+    check(zip(l.lines, l.lines.dropFirst()).allSatisfy { $0.start < $1.start }, "estimate: starts strictly increase")
+    check(zip(l.lines, l.lines.dropFirst()).allSatisfy { abs($0.end - $1.start) < 1e-9 }, "estimate: slots touch, no holes")
+    check(abs(l.lines.last!.end - (200 - outro)) < 1e-9 && l.lines.last!.end <= 200 - outro + 1e-9, "estimate: last end at duration minus outro")
+    // weighting: the 5-char lines get the 8-char minimum, longer lines get proportionally more
+    let len = l.lines.map { $0.end - $0.start }
+    check(abs(len[2] - len[4]) < 1e-9 && len[2] > 0, "estimate: short lines share the minimum weight")
+    check(len[3] > len[1] && len[1] > len[0] && len[0] > len[2], "estimate: longer lines get longer slots")
+    let w = [19, 25, 8, 36, 8].map(Double.init)
+    check(abs(len[3] / len[0] - w[3] / w[0]) < 1e-9, "estimate: slot ratio equals weight ratio")
+    // short song: margins scale with duration
+    let s = LyricsProvider.estimateTiming(plain: "a long enough invented line\nanother invented line", duration: 50)!
+    check(abs(s.lines[0].start - 4) < 1e-9 && abs(s.lines.last!.end - 47) < 1e-9, "estimate: 8% intro and 6% outro on a short song")
+    let t = LyricsProvider.estimateTiming(plain: plain5, duration: nil)!
+    check(t.isEstimated && t.lines.map(\.start) == [0, 3.5, 7, 10.5, 14] && t.lines.last!.end == 17.5, "estimate: unknown duration uses 3.5s per line")
+    check(LyricsProvider.estimateTiming(plain: plain5, duration: 0)?.lines[1].start == 3.5, "estimate: zero duration treated as unknown")
+    check(LyricsProvider.estimateTiming(plain: "", duration: 100) == nil, "estimate: empty is nil")
+    check(LyricsProvider.estimateTiming(plain: " \n\t\n\r\n ", duration: 100) == nil, "estimate: blank lines only is nil")
+    let crlf = LyricsProvider.estimateTiming(plain: "one invented\r\ntwo invented\r\n", duration: 100)!
+    check(crlf.lines.map(\.text) == ["one invented", "two invented"], "estimate: CRLF split")
+    let many = (0..<300).map { "invented line number \($0)" }.joined(separator: "\n")
+    let capped = LyricsProvider.estimateTiming(plain: many, duration: 240)!
+    check(capped.lines.count == LYRICS_ESTIMATE_MAX_LINES && capped.lines.count == 120, "estimate: capped at 120 lines")
+    check(abs(capped.lines.last!.end - (240 - min(10, 240 * 0.06))) < 1e-9 && abs(capped.lines[0].start - min(12, 240 * 0.08)) < 1e-9, "estimate: capped lines still span the song")
+}
+do {
+    // Codable: isEstimated round-trips, and a payload without the field decodes as exact
+    let l = LyricsProvider.estimateTiming(plain: "invented one\ninvented two", duration: 100)!
+    let back = try! JSONDecoder().decode(TimedLyrics.self, from: JSONEncoder().encode(l))
+    check(back == l && back.isEstimated, "TimedLyrics isEstimated round-trips")
+    let legacy = try! JSONDecoder().decode(TimedLyrics.self, from: json(["lines": [["start": 1, "end": 5, "text": "old entry"]]]))
+    check(!legacy.isEstimated && legacy.lines.count == 1, "TimedLyrics without isEstimated decodes as exact")
+    check(!TimedLyrics(lines: []).isEstimated, "isEstimated defaults to false")
+}
+
+// MARK: plain-lyrics fallback
+let plainText = "invented first line\ninvented second line\ninvented third line"
+func plainHit(_ name: String = "River & Moon", _ artist: String = "Paper Lanterns", _ duration: Double = 200,
+              plain: String = plainText, instrumental: Bool = false) -> [String: Any] {
+    ["trackName": name, "artistName": artist, "duration": duration, "plainLyrics": plain, "instrumental": instrumental]
+}
+do {
+    // get is plain-only, search has synced: synced wins
+    resetStub { r in isGet(r) ? (200, json(plainHit())) : (200, json([hit("River & Moon", "Paper Lanterns", 200, "synced from search")])) }
+    let l = fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))
+    check(l?.lines.first?.text == "synced from search" && l?.isEstimated == false, "plain-only get, synced search: synced preferred")
+    check(reqCount() == 2, "plain-only get still searched")
+}
+do {
+    // plain-only everywhere: get's plain, estimated, cached with the flag
+    resetStub { r in isGet(r) ? (200, json(plainHit(plain: "get plain one\nget plain two"))) : (200, json([plainHit(plain: "search plain")])) }
+    let dir = tmpDir()
+    let l = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
+    check(l?.isEstimated == true && l?.lines.map(\.text) == ["get plain one", "get plain two"], "plain-only everywhere: estimated from get's plain")
+    check(reqCount() == 2 && cacheFiles(dir).count == 1, "plain fallback: get then search, one cache file")
+    let before = reqCount()
+    let again = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
+    check(again == l && again?.isEstimated == true && reqCount() == before, "estimated lyrics cached with isEstimated")
+    let raw = try! JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent(cacheFiles(dir)[0]))) as! [String: Any]
+    check(((raw["lyrics"] as? [String: Any])?["isEstimated"] as? Bool) == true && raw["version"] as? Int == LYRICS_CACHE_VERSION, "cache file stores isEstimated and the current version")
+}
+do {
+    // get 404, search plain-only: estimated from the search result
+    resetStub { r in isGet(r) ? (404, Data()) : (200, json([plainHit(plain: "search plain one\nsearch plain two")])) }
+    let l = fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), duration: 200)
+    check(l?.isEstimated == true && l?.lines.first?.text == "search plain one", "get 404, plain-only search: estimated")
+    check(abs((l?.lines.first?.start ?? 0) - 12) < 1e-9, "search plain: timing uses the known duration")
+    // search 404 after a plain get: fall back to the get text
+    resetStub { r in isGet(r) ? (200, json(plainHit(plain: "get only plain"))) : (404, Data()) }
+    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))?.lines.first?.text == "get only plain", "plain get, search 404: get's plain used")
+    // duration unknown: falls back to the result's own length
+    resetStub { r in isGet(r) ? (404, Data()) : (200, json([plainHit("River & Moon", "Paper Lanterns", 100, plain: "one invented line")])) }
+    let own = fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]), duration: nil)
+    check(abs((own?.lines.first?.start ?? 0) - 8) < 1e-9, "no duration: estimate uses the track's own duration")
+}
+do {
+    // synced result among plain ones: synced wins even when the plain one is a closer match
+    resetStub { r in isGet(r) ? (404, Data()) : (200, json([plainHit("River & Moon", "Paper Lanterns", 200),
+        hit("River & Moon", "Paper Lanterns", 202, "synced far-ish")])) }
+    let l = fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0]))
+    check(l?.lines.first?.text == "synced far-ish" && l?.isEstimated == false, "search: synced beats a closer plain-only result")
+}
+do {
+    // instrumental: none, no search for get; flagged search results are skipped
+    resetStub { _ in (200, json(["instrumental": true, "plainLyrics": plainText])) }
+    let dir = tmpDir()
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && reqCount() == 1 && cacheFiles(dir).count == 1, "instrumental with plain text: none")
+    check(isNone(searchResult(results: [plainHit(instrumental: true)])), "instrumental search result with plain text: none")
+}
+do {
+    // empty plain: none
+    resetStub { r in isGet(r) ? (200, json(["plainLyrics": "  \n ", "instrumental": false])) : (200, json([plainHit(plain: "")])) }
+    let dir = tmpDir()
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && cacheFiles(dir).count == 1, "empty plain everywhere: none, negative cached")
+    check(isNone(searchResult(results: [plainHit(plain: "")])), "empty plainLyrics search result: none")
+}
+do {
+    // wrong title / mismatched artist and length: rejected
+    check(isNone(searchResult(results: [plainHit("Different Song")])), "wrong-title plain result rejected")
+    check(isNone(searchResult(results: [plainHit("River & Moon", "Someone Else Entirely", 240)])), "plain result with wrong artist and length rejected")
+    check(searchResult(results: [plainHit("River & Moon", "Someone Else Entirely", 201)]).flatMap(lyricsOf)?.isEstimated == true, "plain result accepted by length like synced ones")
+    check(searchResult(results: [plainHit("River & Moon (feat. Someone Invented)")]).flatMap(lyricsOf)?.isEstimated == true, "plain result title normalization same as synced")
+}
+do {
+    // old-version cache (a negative entry from before plain support) is refetched
+    let dir = tmpDir()
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let old: [String: Any] = ["version": 3, "fetchedAt": Date().timeIntervalSince1970]
+    try! json(old).write(to: dir.appendingPathComponent(LyricsProvider.cacheFileName(for: "t1")))
+    resetStub { r in isGet(r) ? (200, json(plainHit())) : (200, json([plainHit()])) }
+    let first = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
+    check(reqCount() >= 1 && first?.isEstimated == true, "version 3 'none' entry ignored and plain lyrics fetched")
+    let before = reqCount()
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == first && reqCount() == before, "refetched entry rewritten at the current version")
+}
+do {
+    // a current-version entry written before isEstimated existed still decodes
+    let dir = tmpDir()
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let entry: [String: Any] = ["version": LYRICS_CACHE_VERSION, "fetchedAt": Date().timeIntervalSince1970,
+                                "lyrics": ["lines": [["start": 1, "end": 5, "text": "cached invented"]]]]
+    try! json(entry).write(to: dir.appendingPathComponent(LyricsProvider.cacheFileName(for: "t1")))
+    resetStub { _ in (500, Data()) }
+    let l = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
+    check(l?.lines.first?.text == "cached invented" && l?.isEstimated == false && reqCount() == 0, "cache entry without isEstimated decodes as exact")
 }
 
 // MARK: romaji

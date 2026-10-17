@@ -1,5 +1,6 @@
-// Listens to Spotify's audio only, through a Core Audio process tap
-// (macOS 26 taps by bundle ID and re-attaches when Spotify relaunches).
+// Listens to Spotify's audio only (its bundle ID), through a
+// Core Audio process tap (macOS 26 taps by bundle ID and re-attaches when the
+// app relaunches).
 // Needs the "System Audio Recording Only" permission, never Screen Recording.
 // Nothing is recorded or stored: each buffer is reduced to levels and dropped.
 // The private aggregate device is clocked by the output device, so it is torn
@@ -10,7 +11,6 @@ import Foundation
 import QuartzCore
 import os
 
-let TAP_NAME = "Wallpaper Overlay Spotify glow"
 // A device switch fires several property changes in a burst; rebuild once after it settles
 let TAP_REBUILD_DELAY: TimeInterval = 0.3
 // A tap that failed to build is retried when playback resumes, but not more often than this
@@ -33,7 +33,7 @@ private func check(_ status: OSStatus, _ step: String) throws {
 
 private func logIfFailed(_ status: OSStatus, _ step: String) {
     guard status != noErr else { return }
-    NSLog("wallpaper-overlay: Spotify audio tap: %@ failed (OSStatus %d)", step, status)
+    NSLog("wallpaper-overlay: audio tap: %@ failed (OSStatus %d)", step, status)
 }
 
 private func systemPropertyAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
@@ -105,9 +105,12 @@ final class SpotifyAudioTap: @unchecked Sendable {
 
     private let shared = OSAllocatedUnfairLock(initialState: AudioLevels())
     private let status = OSAllocatedUnfairLock(initialState: Status())
-    private let ioQueue = DispatchQueue(label: "wallpaper-overlay.spotify-tap", qos: .userInteractive)
+    private let ioQueue = DispatchQueue(label: "wallpaper-overlay.app-tap", qos: .userInteractive)
     private let control = DispatchQueue(label: AUDIO_CONTROL_QUEUE_LABEL, qos: .userInitiated)
     private let controlKey = DispatchSpecificKey<Void>()
+    private let bundleID = SPOTIFY_BUNDLE_ID
+    private let appName = SPOTIFY_DISPLAY_NAME
+    private let tapName: String
     private let now: () -> CFTimeInterval
     // Replaces the Core Audio build steps; lets tests drive the queue logic without a real tap
     private let buildOverride: (() throws -> Void)?
@@ -122,7 +125,9 @@ final class SpotifyAudioTap: @unchecked Sendable {
     private var deviceListener: OutputDeviceListener?
     private var rebuildWork: DispatchWorkItem?
 
-    init(now: @escaping () -> CFTimeInterval = CACurrentMediaTime, buildOverride: (() throws -> Void)? = nil) {
+    init(now: @escaping () -> CFTimeInterval = CACurrentMediaTime,
+         buildOverride: (() throws -> Void)? = nil) {
+        tapName = "Wallpaper Overlay \(appName) glow"
         self.now = now
         self.buildOverride = buildOverride
         control.setSpecific(key: controlKey, value: ())
@@ -211,7 +216,7 @@ final class SpotifyAudioTap: @unchecked Sendable {
             setHealthy(true)
         } catch {
             // A stale aggregate device is the usual cause; one fresh build is cheap
-            NSLog("wallpaper-overlay: Spotify audio tap failed to resume: %@; rebuilding", "\(error)")
+            NSLog("wallpaper-overlay: %@ audio tap failed to resume: %@; rebuilding", appName, "\(error)")
             setHealthy(false)
             rebuild()
         }
@@ -229,7 +234,7 @@ final class SpotifyAudioTap: @unchecked Sendable {
 
     private func rebuildIfDue() {
         if let last = lastBuildAttempt, now() - last < TAP_RETRY_MIN_INTERVAL { return }
-        NSLog("wallpaper-overlay: Spotify audio tap isn't running; retrying the build")
+        NSLog("wallpaper-overlay: %@ audio tap isn't running; retrying the build", appName)
         rebuild()
     }
 
@@ -250,7 +255,7 @@ final class SpotifyAudioTap: @unchecked Sendable {
             setHealthy(true)
             return true
         } catch {
-            NSLog("wallpaper-overlay: Spotify audio tap unavailable: %@", "\(error)")
+            NSLog("wallpaper-overlay: %@ audio tap unavailable: %@", appName, "\(error)")
             teardown()
             setHealthy(false)
             return false
@@ -269,7 +274,7 @@ final class SpotifyAudioTap: @unchecked Sendable {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isStarted else { return }
             self.rebuildWork = nil
-            NSLog("wallpaper-overlay: output device changed; rebuilding the Spotify audio tap")
+            NSLog("wallpaper-overlay: output device changed; rebuilding the %@ audio tap", self.appName)
             self.rebuild()
         }
         rebuildWork = work
@@ -308,8 +313,8 @@ final class SpotifyAudioTap: @unchecked Sendable {
 
     private func createTap() throws -> String {
         let description = CATapDescription()
-        description.name = TAP_NAME
-        description.bundleIDs = [SPOTIFY_BUNDLE_ID]
+        description.name = tapName
+        description.bundleIDs = [bundleID]
         description.isProcessRestoreEnabled = true
         description.isPrivate = true
         description.isMixdown = true
@@ -323,7 +328,7 @@ final class SpotifyAudioTap: @unchecked Sendable {
     private func createAggregateDevice(tapUID: String) throws {
         let outputUID = try defaultOutputDeviceUID()
         let config: [String: Any] = [
-            kAudioAggregateDeviceNameKey: TAP_NAME,
+            kAudioAggregateDeviceNameKey: tapName,
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
             kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceIsPrivateKey: true,

@@ -3,7 +3,7 @@ func check(_ c: Bool, _ msg: String) { print(c ? "PASS" : "FAIL", msg); if !c { 
 check(formatClock(0, showTenths: true) == "00:00.0", "stopwatch zero")
 check(formatClock(65.37, showTenths: true) == "01:05.3", "stopwatch tenths")
 check(formatClock(3725, showTenths: false) == "1:02:05", "hours format")
-let m = ClockModel()
+let m = ClockModel(defaultMinutes: 25, maxMinutes: 99)
 check(m.mode == .stopwatch && !m.isRunning, "starts as idle stopwatch")
 m.toggleRunning(); Thread.sleep(forTimeInterval: 0.2); m.toggleRunning()
 let paused = m.displayTime

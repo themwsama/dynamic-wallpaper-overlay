@@ -2,7 +2,9 @@
 // video ("stagger rise"): characters rise in one by one out of a blur, a
 // karaoke sweep in the genre's color crosses the line over its duration,
 // and the line drifts up and fades as the next one arrives. Optional romaji
-// sits small underneath. Core Animation does all of it on the GPU.
+// sits small underneath. Lyrics whose timing is only estimated skip the sweep (it
+// would claim exact timing), draw a little dimmer and carry a small marker.
+// Core Animation does all of it on the GPU.
 import AppKit
 import QuartzCore
 
@@ -24,6 +26,10 @@ let LYRICS_ENTRY_BLUR: CGFloat = 8
 let LYRICS_FADE_DURATION: CFTimeInterval = 0.6  // whole box, on pause or toggle
 let LYRICS_JAPANESE_FONT = "HiraMinProN-W6"
 let LYRICS_LATIN_FONT = "Baskerville-SemiBold"
+let LYRICS_ESTIMATED_OPACITY: Float = 0.85  // of the normal line opacity
+let LYRICS_ESTIMATED_MARKER = "♪ approximate"
+let LYRICS_ESTIMATED_MARKER_FONT = NSFont(name: "Baskerville-Italic", size: 9) ?? .systemFont(ofSize: 9)
+let LYRICS_ESTIMATED_MARKER_ALPHA: CGFloat = 0.5
 let LYRICS_SWEEP_MIN_DURATION: TimeInterval = 0.5
 let LYRICS_SWEEP_TAIL: TimeInterval = 0.3  // the sweep ends this long before the line does
 let LYRICS_SWEEP_ENTRY_SHARE: Double = 0.8  // the sweep starts once this much of the entry has played
@@ -47,6 +53,13 @@ func sweepSchedule(rowLengths: [Int], now: CFTimeInterval, entryDelay: TimeInter
         begin += slot.duration
         return slot
     }
+}
+
+// Estimated lines get no sweep at all: a karaoke sweep implies exact timing
+func lineSweepSchedule(isEstimated: Bool, rowLengths: [Int], now: CFTimeInterval, entryDelay: TimeInterval,
+                       lineDuration: TimeInterval) -> [SweepSlot] {
+    guard !isEstimated else { return [] }
+    return sweepSchedule(rowLengths: rowLengths, now: now, entryDelay: entryDelay, lineDuration: lineDuration)
 }
 
 func containsJapanese(_ text: String) -> Bool {
@@ -90,14 +103,17 @@ final class LyricsView: NSView {
 
     // `duration` is how long the line stays up; the karaoke sweep spans most of it.
     // Long lines wrap onto two rows; the sweep crosses them in reading order.
-    func show(text: String, romaji: String?, duration: TimeInterval, accent: NSColor, reducedMotion: Bool) {
+    // `isEstimated` lines have no sweep, a lower opacity and an "approximate" marker.
+    func show(text: String, romaji: String?, duration: TimeInterval, accent: NSColor, reducedMotion: Bool,
+              isEstimated: Bool = false) {
         retireCurrentLine()
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
         let scale = window?.backingScaleFactor ?? 2
         let (rows, font) = layoutRows(for: trimmed)
         let rowHeight = ceil(font.ascender - font.descender + font.leading) + 2
-        let romajiHeight = romaji == nil ? 0 : ceil(LYRICS_ROMAJI_FONT.ascender - LYRICS_ROMAJI_FONT.descender) + 2
+        let hasSubRow = romaji != nil || isEstimated
+        let romajiHeight = !hasSubRow ? 0 : ceil(LYRICS_ROMAJI_FONT.ascender - LYRICS_ROMAJI_FONT.descender) + 2
 
         let container = CALayer()
         container.frame = bounds
@@ -105,17 +121,19 @@ final class LyricsView: NSView {
         container.shadowOpacity = 1
         container.shadowRadius = 9
         container.shadowOffset = .zero
+        let containerOpacity = isEstimated ? LYRICS_ESTIMATED_OPACITY : 1
+        container.opacity = containerOpacity
         root.addSublayer(container)
         current = container
 
         // Bottom-up: romaji on the floor of the box, the rows stacked above it
         let now = CACurrentMediaTime()
-        let sweeps = sweepSchedule(rowLengths: rows.map(\.count), now: now,
-                                   entryDelay: reducedMotion ? 0 : LYRICS_ENTRY_DURATION * LYRICS_SWEEP_ENTRY_SHARE,
-                                   lineDuration: duration)
+        let sweeps = lineSweepSchedule(isEstimated: isEstimated, rowLengths: rows.map(\.count), now: now,
+                                       entryDelay: reducedMotion ? 0 : LYRICS_ENTRY_DURATION * LYRICS_SWEEP_ENTRY_SHARE,
+                                       lineDuration: duration)
         var characterIndex = 0
         for (rowIndex, row) in rows.enumerated() {
-            let y = romajiHeight + (romaji == nil ? 0 : LYRICS_LINE_GAP) + CGFloat(rows.count - 1 - rowIndex) * rowHeight
+            let y = romajiHeight + (!hasSubRow ? 0 : LYRICS_LINE_GAP) + CGFloat(rows.count - 1 - rowIndex) * rowHeight
             let line = tracked(row, font: font, tracking: LYRICS_TRACKING, color: TEXT_COLOR)
             for (character, x, width) in characterOffsets(line) {
                 defer { characterIndex += 1 }
@@ -127,22 +145,38 @@ final class LyricsView: NSView {
                 container.addSublayer(glyph)
                 if !reducedMotion { animateEntry(glyph, begin: now + Double(characterIndex) * LYRICS_CHAR_STAGGER) }
             }
-            let slot = sweeps[rowIndex]
-            addSweep(to: container, line: line, accent: accent,
-                     frame: NSRect(x: 0, y: y, width: visibleWidth(line, tracking: LYRICS_TRACKING) + 4, height: rowHeight),
-                     begin: slot.begin, duration: slot.duration, scale: scale)
+            if rowIndex < sweeps.count {
+                let slot = sweeps[rowIndex]
+                addSweep(to: container, line: line, accent: accent,
+                         frame: NSRect(x: 0, y: y, width: visibleWidth(line, tracking: LYRICS_TRACKING) + 4, height: rowHeight),
+                         begin: slot.begin, duration: slot.duration, scale: scale)
+            }
         }
-        if let romaji {
+        if hasSubRow {
             let text = CATextLayer()
-            text.string = tracked(romaji, font: LYRICS_ROMAJI_FONT, tracking: LYRICS_ROMAJI_TRACKING,
-                                  color: TEXT_COLOR.withAlphaComponent(0.8))
+            text.string = subRowText(romaji: romaji, isEstimated: isEstimated)
             text.contentsScale = scale
             text.truncationMode = .end
             text.frame = NSRect(x: 0, y: 0, width: bounds.width, height: romajiHeight)
             container.addSublayer(text)
             fadeIn(text, begin: now + (reducedMotion ? 0 : 0.5))
         }
-        if reducedMotion { fadeIn(container, begin: now) }
+        if reducedMotion { fadeIn(container, begin: now, to: containerOpacity) }
+    }
+
+    // The romaji, then the estimated-timing marker after it; the marker alone when romaji is off
+    private func subRowText(romaji: String?, isEstimated: Bool) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        if let romaji {
+            result.append(tracked(romaji, font: LYRICS_ROMAJI_FONT, tracking: LYRICS_ROMAJI_TRACKING,
+                                  color: TEXT_COLOR.withAlphaComponent(0.8)))
+        }
+        if isEstimated {
+            let marker = romaji == nil ? LYRICS_ESTIMATED_MARKER : "  " + LYRICS_ESTIMATED_MARKER
+            result.append(tracked(marker, font: LYRICS_ESTIMATED_MARKER_FONT, tracking: LYRICS_ROMAJI_TRACKING,
+                                  color: TEXT_COLOR.withAlphaComponent(LYRICS_ESTIMATED_MARKER_ALPHA)))
+        }
+        return result
     }
 
     // One row at the largest size that fits; failing that, two rows split at
@@ -255,10 +289,10 @@ final class LyricsView: NSView {
         mask.add(grow, forKey: "sweep")
     }
 
-    private func fadeIn(_ layer: CALayer, begin: CFTimeInterval) {
+    private func fadeIn(_ layer: CALayer, begin: CFTimeInterval, to opacity: Float = 1) {
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0
-        fade.toValue = 1
+        fade.toValue = opacity
         fade.beginTime = begin
         fade.duration = 0.6
         fade.fillMode = .backwards

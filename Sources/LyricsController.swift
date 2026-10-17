@@ -1,7 +1,7 @@
-// Keeps the lyric box in step with Spotify: fetches synced lyrics for each new
-// track, follows the playback position, and shows the line being sung on
+// Keeps the lyric box in step with the music app: fetches lyrics (synced, or plain with
+// estimated timing) for each new track, follows the playback position, and shows the line being sung on
 // every screen. Fades out on pause, when lyrics are turned off, or when a
-// song has no synced lyrics.
+// song has no lyrics at all.
 import AppKit
 
 let LYRICS_TICK_INTERVAL: TimeInterval = 1.0 / 15
@@ -40,10 +40,10 @@ final class LyricsController {
         }
     }
 
-    // `position` is the one Spotify sent with this change, if it's fresh.
+    // `position` is the one the music app sent with this change, if it's fresh.
     // The old song's lyrics and line go first, then the clock moves, so no tick
     // can pair the previous song's lines with the new song's position.
-    func trackChanged(_ track: SpotifyTrack, position: (seconds: TimeInterval, at: CFTimeInterval)?) {
+    func trackChanged(_ track: SpotifyTrack, position: SpotifyPositionStamp?) {
         trackID = track.id
         lyrics = nil
         shownIndex = nil
@@ -65,7 +65,12 @@ final class LyricsController {
             guard let self, self.lookupGeneration == generation else { return }
             switch outcome {
             case .found(let found):
-                NSLog("wallpaper-overlay: lyrics %@ – %@: %d synced lines", track.artist, track.name, found.lines.count)
+                if found.isEstimated {
+                    NSLog("wallpaper-overlay: lyrics %@ – %@: %d plain lines (estimated timing)",
+                          track.artist, track.name, found.lines.count)
+                } else {
+                    NSLog("wallpaper-overlay: lyrics %@ – %@: %d synced lines", track.artist, track.name, found.lines.count)
+                }
                 self.lyrics = found
                 self.updateVisibility()
             case .none:
@@ -94,7 +99,7 @@ final class LyricsController {
         updateVisibility()
     }
 
-    // Spotify stopped (not just paused): forget the song entirely. Safe to call
+    // Playback stopped (not just paused): forget the song entirely. Safe to call
     // before or after the final playStateChanged(false), and more than once.
     func playbackEnded() {
         trackID = nil
@@ -166,7 +171,8 @@ final class LyricsController {
         let reducedMotion = ProcessInfo.processInfo.isLowPowerModeEnabled
         let color = accent()
         views().forEach {
-            $0.show(text: line.text, romaji: romaji, duration: remaining, accent: color, reducedMotion: reducedMotion)
+            $0.show(text: line.text, romaji: romaji, duration: remaining, accent: color, reducedMotion: reducedMotion,
+                    isEstimated: lyrics.isEstimated)
         }
     }
 }

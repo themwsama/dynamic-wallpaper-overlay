@@ -91,6 +91,12 @@ scripts/install.sh --name "ADA LOVELACE" --subtitle "ENGINEER · LONDON" --sampl
 
 Preview without changing anything: prefix with `DRY_RUN=1`.
 
+Optional: `scripts/install.sh --stable-signing` creates a local self-signed
+code-signing identity, "Wallpaper Overlay Local Signing", so macOS permission
+grants survive rebuilds (section 6). It adds a keychain item, so ask the user
+first. `build.sh` signs with `SIGNING_IDENTITY` or that identity when present,
+and falls back to ad-hoc.
+
 What `install.sh` does, in order:
 
 1. Checks macOS 26+, `swiftc` and `ffmpeg`.
@@ -101,7 +107,8 @@ What `install.sh` does, in order:
    or from `scripts/make-sample-video.sh`.
 4. Runs `scripts/build.sh`: compiles `Sources/*.swift` into
    `~/Applications/Wallpaper Overlay.app`, writes Info.plist with the usage
-   descriptions, signs ad-hoc, and copies `Transition.metal` next to the config.
+   descriptions, signs with `SIGNING_IDENTITY` or the local signing identity if
+   present (otherwise ad-hoc), and copies `Transition.metal` next to the config.
 5. Writes and loads the LaunchAgent `~/Library/LaunchAgents/local.wallpaper-overlay.plist`
    (RunAtLoad + KeepAlive), so it starts at login and restarts if it crashes.
 6. Prints the permission prompts to expect and how to add optional API keys.
@@ -135,7 +142,7 @@ All of these sit **behind** normal app windows, like a real wallpaper:
 | **Gear + control center** | A glass gear at the end of the subtitle row opens an iOS-style tile grid: Clock, Glass/Original, transition style, Glow, Lyrics, Romaji, and a Low power indicator. Clicking outside closes it. |
 | **Clock card** | Glass stopwatch / countdown timer under the name; it slides out of the way when the control center opens |
 | **Music glow** | While Spotify plays: a soft glow along the bottom edge that pulses with the real beat, colored by the song's genre, with fire sparks launched on the beat at the song's tempo |
-| **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese |
+| **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese. Songs LRCLIB has only as plain text show with estimated timing: no sweep, slightly dimmer, marked "♪ approximate" |
 | **Efficiency** | ~200 MB memory while visible; pauses and releases all video memory when the screen sleeps or locks, or the desktop is fully covered. Each screen pauses on its own when covered. Idle rendering is capped at about 1.25× the video resolution; 30 fps cap in Low Power Mode |
 
 ---
@@ -152,8 +159,9 @@ Screen Recording is **not** needed. There is no keyboard monitoring, and the
 outside-click detection for the control center uses mouse-only event monitors,
 which need no Accessibility permission.
 
-**Rebuilds:** the app is signed ad-hoc, so macOS may ask for the audio
-permission again after rebuilding. Re-allow it in System Settings.
+**Rebuilds:** by default the app is signed ad-hoc, so macOS may ask for the
+audio permission again after rebuilding. Re-allow it in System Settings.
+`scripts/install.sh --stable-signing` avoids this (section 4).
 
 ---
 
@@ -169,23 +177,23 @@ permission again after rebuilding. Re-allow it in System Settings.
 | `Settings.swift` | UserDefaults-backed toggles (clock, glass, transition, glow, lyrics, romaji) with observers |
 | `TextBlock.swift` | Draws the name, rule and subtitle; leaves room for the gear |
 | `ControlCenter.swift` | Gear-opened glass panel of `TileButton`s; outside-click close |
-| `ClockModel.swift`, `ClockView.swift` | Stopwatch/timer logic and the glass card; `GlassButton`, `makeGlassCard` (Liquid Glass with a blur fallback) |
+| `ClockModel.swift`, `ClockView.swift` | Stopwatch/timer logic (timer limits injected) and the glass card; `GlassButton`, `makeGlassCard` (Liquid Glass with a blur fallback) |
 | `VideoFrames.swift` | One `AVPlayerItem` looped by seek; frames as 4:2:0 `CVPixelBuffer`s |
 | `TransitionRenderer.swift` | `MTKView` delegate per screen: uploads the luma/chroma planes, fills uniforms, plays transitions, frame-rate policy |
 | `Transition.metal` | All GPU visuals: YUV→RGB, aspect fill, the three transitions, music glow, fire sparks. **Compiled at launch** from `~/.config/wallpaper-overlay/Transition.metal` |
 | `DigitAtlas.swift` | Nixie-tube digit texture (sharp + glow channels) |
 | `GlowController.swift` | Glow presence/energy/beat/colors per frame; genre → look table |
-| `SpotifyWatcher.swift` | Listens for `com.spotify.client.PlaybackStateChanged` distributed notifications (no permission) |
-| `SpotifyAudioTap.swift` | Core Audio process tap on bundle `com.spotify.client` → `AudioAnalyzer` |
+| `SpotifyWatcher.swift` | Spotify distributed notifications (`com.spotify.client.PlaybackStateChanged`, no permission); the launch-time now-playing AppleScript query; the shared Spotify script queue (`SPOTIFY_BUNDLE_ID`) |
+| `SpotifyAudioTap.swift` | Core Audio process tap on Spotify (`com.spotify.client`) → `AudioAnalyzer`; rebuilds on output-device change, on a private control queue |
+| `MusicSession.swift` | Owns `SpotifyWatcher` and `SpotifyAudioTap`, the 15 s pause grace period, the launch bootstrap and the Spotify-quit observer; `main.swift` wires it to genre, lyrics and glow |
 | `AudioAnalyzer.swift` | Real-time-safe loudness, bass, beat onsets, tempo (median beat gap, folded into 60–180 BPM) |
 | `GenreResolver.swift` | Track → genre bucket: cache, then iTunes Search (free, no key), then Spotify Web API (optional keys), then Gemini (optional key) |
-| `LyricsProvider.swift` | LRCLIB client (`/api/get`, falling back to `/api/search`), LRC parser, retries, on-disk cache, offline romaji via `CFStringTokenizer` |
-| `PlaybackClock.swift` | Interpolated playback position; polls Spotify every 2 s while playing |
-| `LyricsController.swift` | Picks the current line, drives `LyricsView`; launch-time "what's playing" query |
+| `LyricsProvider.swift` | LRCLIB client (`/api/get`, falling back to `/api/search`; plain-only lyrics get estimated timing), LRC parser, retries, on-disk cache, offline romaji via `CFStringTokenizer` |
+| `PlaybackClock.swift` | Interpolated playback position; polls Spotify every 2 s while playing. Bundle ID and position source are injected, with no globals |
+| `LyricsController.swift` | Picks the current line, drives `LyricsView` |
 | `LyricsView.swift` | Core Animation kinetic text: per-character rise/blur-in, karaoke sweep, two-row wrap |
 | `VisibilityMonitor.swift` | Sleep/lock/session/occlusion detection → pause rendering and free frames |
 | `Housekeeping.swift` | Prunes the lyrics cache (60 days / 400 files) and trims the log in place (2 MB → 500 KB) every 6 h |
-| `SpotifyNowPlaying.swift` | Launch-time "what's playing" query; all Spotify AppleScript calls share one serial queue (`SPOTIFY_BUNDLE_ID`) |
 | `scripts/lib.sh` | Shared script helpers: env overrides, `DRY_RUN` parsing, `BUNDLE_ID` validation, default paths |
 
 ### 7.2 Windows and z-order (lowest to highest)
@@ -206,10 +214,15 @@ become key), so clicking them never steals focus from the user's app.
 ### 7.3 Data flow
 
 ```
-Spotify ──distributed notification──▶ SpotifyWatcher ──track──▶ GenreResolver ──bucket──▶ GlowController (colors)
-   │                                        │ └────────track────▶ LyricsController ──▶ LyricsProvider (LRCLIB)
-   │                                        └──play/pause/pos──▶ PlaybackClock ◀──AppleScript poll (2 s)
-   └──audio (process tap)──▶ AudioAnalyzer ──level/beat/BPM──▶ GlowController ──uniforms──▶ Transition.metal
+MusicSession (owns SpotifyWatcher and SpotifyAudioTap; 15 s pause grace; launch bootstrap; Spotify-quit observer)
+   │
+   ├── SpotifyWatcher ◀──distributed notification── Spotify
+   │      ├──track──▶ GenreResolver ──bucket──▶ GlowController (colors)
+   │      ├──track──▶ LyricsController ──▶ LyricsProvider (LRCLIB)
+   │      └──play/pause/pos──▶ PlaybackClock ◀──AppleScript poll (2 s)
+   │
+   └── SpotifyAudioTap ◀──audio (process tap)── Spotify
+          └──▶ AudioAnalyzer ──level/beat/BPM──▶ GlowController ──uniforms──▶ Transition.metal
 VideoFrames ──YUV planes──▶ TransitionRenderer ──▶ Transition.metal ──▶ MTKView per screen
 Settings ◀── ControlCenter tiles          VisibilityMonitor ──▶ TransitionRenderer.setPaused
 ```
@@ -423,8 +436,12 @@ wallpaper-overlay: wallpaper hidden, pausing and releasing frames
 ## 12. Known limitations
 
 - macOS 26+ only (Liquid Glass and process taps by bundle ID).
-- Spotify desktop only; Apple Music and web players aren't detected.
+- Spotify desktop only, by design. Other players and web players aren't
+  detected, and no support is planned.
 - Lyrics depend on LRCLIB's community database.
-- Ad-hoc signing means permission prompts can return after rebuilds; a
-  Developer ID-signed, notarized release would fix this (see `docs/PLAN.md`).
+- Ad-hoc signing (the default) makes permission prompts return after rebuilds.
+  `install.sh --stable-signing` avoids that with a local identity. The identity
+  is self-signed, untrusted and local to this Mac. Remove it with
+  `security delete-identity -c "Wallpaper Overlay Local Signing"`. A Developer
+  ID-signed, notarized release would be the real fix (see `docs/PLAN.md`).
 - The video must be pre-processed into the stacked format.

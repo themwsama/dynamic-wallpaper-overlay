@@ -1,5 +1,5 @@
 // Drives the music glow at the bottom of the wallpaper: fades it in while
-// Spotify is audibly playing and out when it stops, blends to the current
+// the music app is audibly playing and out when it stops, blends to the current
 // genre's colors, and turns loudness and beats into pulse and ember speed.
 // Values from the Claude Design "Music Glow Study" canvas.
 import AppKit
@@ -15,7 +15,7 @@ let GLOW_INTENSITY: Float = 0.22
 let GLOW_HEIGHT: Float = 0.34              // fraction of screen height
 let GLOW_SPARK_COUNT: Float = 8
 let GLOW_TEMPO_BLEND_SECONDS: Double = 1.0 // tempo changes ease in rather than jump
-// Spotify says it's playing but the tap hears nothing (e.g. the audio permission was
+// The music app says it's playing but the tap hears nothing (e.g. the audio permission was
 // denied, which yields silent buffers): after this long, pulse from the play state
 let GLOW_TAP_SILENCE_FALLBACK: CFTimeInterval = 3
 let GLOW_PATH_BLEND_SECONDS: Double = 0.5  // crossfade between the real and simulated pulse
@@ -55,7 +55,7 @@ struct GlowUniforms {
 
 final class GlowController {
     private let audioLevels: () -> AudioLevels?   // nil when the tap isn't running or isn't healthy
-    private let isSpotifyPlaying: () -> Bool
+    private let isMusicPlaying: () -> Bool
     private var look = GENRE_LOOKS[.defaultMix]!
     private var colorA = GENRE_LOOKS[.defaultMix]!.colorA
     private var colorB = GENRE_LOOKS[.defaultMix]!.colorB
@@ -66,13 +66,13 @@ final class GlowController {
     private var lastUpdate: CFTimeInterval?
     private var realWeight: Double = 0  // 1 = driven by the tap, 0 = simulated from the play state
     private var lastRealLevels: AudioLevels?  // what the real side fades out from
-    private var wasSpotifyPlaying = false
+    private var wasMusicPlaying = false
     private var playStartedAt: CFTimeInterval = -.infinity
     var isEnabled = true  // the control center's Glow tile; turning it off fades the glow out
 
-    init(audioLevels: @escaping () -> AudioLevels?, isSpotifyPlaying: @escaping () -> Bool) {
+    init(audioLevels: @escaping () -> AudioLevels?, isMusicPlaying: @escaping () -> Bool) {
         self.audioLevels = audioLevels
-        self.isSpotifyPlaying = isSpotifyPlaying
+        self.isMusicPlaying = isMusicPlaying
     }
 
     // The genre color currently showing, mid-blend included; the lyric sweep uses it
@@ -91,10 +91,10 @@ final class GlowController {
     func uniforms(now: CFTimeInterval) -> GlowUniforms {
         let dt = min(0.1, max(0, now - (lastUpdate ?? now)))
         lastUpdate = now
-        let spotifyPlaying = isSpotifyPlaying()
-        if spotifyPlaying && !wasSpotifyPlaying { playStartedAt = now }
-        wasSpotifyPlaying = spotifyPlaying
-        let levels = realLevels(now: now, spotifyPlaying: spotifyPlaying)
+        let musicPlaying = isMusicPlaying()
+        if musicPlaying && !wasMusicPlaying { playStartedAt = now }
+        wasMusicPlaying = musicPlaying
+        let levels = realLevels(now: now, musicPlaying: musicPlaying)
         // Linear, so a switch in either direction lands in GLOW_PATH_BLEND_SECONDS with no pop
         let step = dt / GLOW_PATH_BLEND_SECONDS
         realWeight = levels == nil ? max(0, realWeight - step) : min(1, realWeight + step)
@@ -102,7 +102,7 @@ final class GlowController {
         if let levels { lastRealLevels = levels }
         let fading = levels ?? lastRealLevels
 
-        let isPlaying = isEnabled && (levels.map { now - $0.lastSound < GLOW_SILENCE_GRACE } ?? spotifyPlaying)
+        let isPlaying = isEnabled && (levels.map { now - $0.lastSound < GLOW_SILENCE_GRACE } ?? musicPlaying)
         let realBeat = fading.map { Float(exp(-max(0, now - $0.lastBeat) / GLOW_BEAT_DECAY)) } ?? 0
         let beat = simulatedBeat(now) * (1 - w) + realBeat * w
         let realEnergy = fading.map { min(1, $0.level * GLOW_LEVEL_GAIN) } ?? 0
@@ -128,12 +128,12 @@ final class GlowController {
     }
 
     // The tap's levels, or nil when the simulated path should drive the glow: no
-    // healthy tap, or Spotify has been "playing" for a while with no sound at all.
+    // healthy tap, or the app has been "playing" for a while with no sound at all.
     // Silence is counted from the play start too, since a resumed tap reports none yet.
-    private func realLevels(now: CFTimeInterval, spotifyPlaying: Bool) -> AudioLevels? {
+    private func realLevels(now: CFTimeInterval, musicPlaying: Bool) -> AudioLevels? {
         guard let levels = audioLevels() else { return nil }
         let silentFor = now - max(levels.lastSound, playStartedAt)
-        return spotifyPlaying && silentFor > GLOW_TAP_SILENCE_FALLBACK ? nil : levels
+        return musicPlaying && silentFor > GLOW_TAP_SILENCE_FALLBACK ? nil : levels
     }
 
     // Without the audio tap, pulse at the genre's typical tempo instead

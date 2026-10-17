@@ -1,6 +1,7 @@
 import Foundation
 
-let SUITE = "wallpaper-overlay-settings-test"
+// A fresh suite per run; run.sh passes it so its trap can clean up even after a crash
+let SUITE = CommandLine.arguments.dropFirst().first ?? "wallpaper-overlay-settings-test-\(UUID().uuidString)"
 var failed = false
 
 func check(_ name: String, _ ok: Bool) {
@@ -61,5 +62,6 @@ let missing = Settings(defaults: d)
 check("default after clear", missing.isClockVisible && !missing.isRomajiEnabled)
 
 d.removePersistentDomain(forName: SUITE)
+d.synchronize()
 if failed { exit(1) }
 print("ALL PASS")

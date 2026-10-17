@@ -5,6 +5,7 @@ DEFAULT_CONFIG_DIR="$HOME/.config/wallpaper-overlay"
 DEFAULT_OUT_DIR="$HOME/Applications"
 DEFAULT_BUNDLE_ID="local.wallpaper-overlay"
 DEFAULT_LOG_PATH="$HOME/Library/Logs/wallpaper-overlay.log"
+DEFAULT_SIGNING_NAME="Wallpaper Overlay Local Signing"
 EXPECTED_CONFIG_LEAF="wallpaper-overlay"
 CONFIG_MARKER=".wallpaper-overlay"
 MIN_RM_COMPONENTS=3

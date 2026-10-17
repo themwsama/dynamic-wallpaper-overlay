@@ -9,9 +9,11 @@ func check(_ name: String, _ ok: Bool) {
 func near(_ a: TimeInterval?, _ b: TimeInterval) -> Bool { a.map { abs($0 - b) < 1e-9 } ?? false }
 
 let queueKey = DispatchSpecificKey<Bool>()
-SPOTIFY_SCRIPT_QUEUE.setSpecific(key: queueKey, value: true)
+let scriptQueue = DispatchQueue(label: "test.script-queue")
+scriptQueue.setSpecific(key: queueKey, value: true)
 
 final class FakeSource: SpotifyPositionSource {
+    let queue = scriptQueue
     private let lock = NSLock()
     private var value: TimeInterval?
     private var count = 0
@@ -38,7 +40,8 @@ var time: CFTimeInterval = 1000
 var running = true
 var logs: [String] = []
 let source = FakeSource()
-let clock = PlaybackClock(source: source, now: { time }, isSpotifyRunning: { running }, log: { logs.append($0) })
+let clock = PlaybackClock(bundleID: "com.example.player", source: source,
+                          now: { time }, isAppRunning: { running }, log: { logs.append($0) })
 
 func poll(_ v: TimeInterval?, error: Int? = nil) {
     source.set(v, error: error)
@@ -86,9 +89,21 @@ check("plays on after sync", near(clock.position(), 2.0))
 let calls = source.calls
 running = false
 poll(5)
-check("no query when Spotify not running", source.calls == calls && near(clock.position(), 2.0))
+check("no query when the app is not running", source.calls == calls && near(clock.position(), 2.0))
 running = true
-check("queries run on the shared Spotify script queue", source.calls > 0 && source.callsOffSharedQueue == 0)
+check("queries run on the source's script queue", source.calls > 0 && source.callsOffSharedQueue == 0)
+
+// Without an injected check, the clock asks NSWorkspace about its own bundle ID
+let defaultSource = FakeSource()
+defaultSource.set(5)
+let defaultClock = PlaybackClock(bundleID: "com.example.not-installed-\(UUID().uuidString)",
+                                 source: defaultSource, now: { time }, log: { _ in })
+var defaultDone = false
+defaultClock.setPlaying(true)
+defaultClock.pollOnce { defaultDone = true }
+spin { defaultDone }
+check("default running check uses the bundle ID (absent app is never queried)", defaultSource.calls == 0)
+defaultClock.setPlaying(false)
 
 // MARK: backoff and recovery
 check("available initially", clock.isAvailable)
@@ -103,6 +118,7 @@ poll(nil, error: -1743)
 check("unavailable after 3 nils in a row", !clock.isAvailable)
 check("backs off to the retry interval", clock.pollInterval == PLAYBACK_RETRY_INTERVAL && PLAYBACK_RETRY_INTERVAL == 60)
 check("logs once with the AppleScript error number", logs.count == 1 && logs[0].contains("-1743"))
+check("log names the app", logs[0].contains("Spotify position unavailable"))
 check("-1743 is logged as permission denied", logs[0].contains("permission denied"))
 poll(nil, error: -1743); poll(nil, error: -1743)
 check("further failures stay quiet", logs.count == 1 && !clock.isAvailable)
@@ -140,6 +156,7 @@ check("-600 (app not running) slows to the retry interval",
       !clock.isAvailable && clock.pollInterval == PLAYBACK_RETRY_INTERVAL)
 check("-600 is logged with its number and not as permission denied",
       logs.last?.contains("-600") == true && logs.last?.contains("permission denied") == false)
+check("-600 reason names the app", logs.last?.contains("Spotify not running") == true)
 poll(64)
 check("recovers from -600", clock.isAvailable)
 poll(nil, error: -1728); poll(nil, error: -1728); poll(nil, error: -1743)

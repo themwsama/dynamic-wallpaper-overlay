@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build Wallpaper Overlay as a macOS app bundle from Sources/*.swift.
-# Env: OUT_DIR (default ~/Applications), BUNDLE_ID (default local.wallpaper-overlay),
+# Env: SIGNING_IDENTITY (optional), OUT_DIR (default ~/Applications), BUNDLE_ID (default local.wallpaper-overlay),
 #      CONFIG_DIR (default ~/.config/wallpaper-overlay), DRY_RUN (any value except 0/false/no/off).
 set -euo pipefail
 
@@ -20,7 +20,8 @@ usage() {
 Usage: $(basename "$0") [--install]
 
 Compiles Sources/*.swift into "$BUNDLE" (built in a temp bundle first, then moved
-into place; a failed build leaves the old app untouched), ad-hoc signs it, and puts
+into place; a failed build leaves the old app untouched), signs it (SIGNING_IDENTITY, else the local "$DEFAULT_SIGNING_NAME"
+identity if it exists, else ad-hoc), and puts
 Transition.metal in the bundle's Resources. $CONFIG_DIR/Transition.metal is only
 created when missing; an existing copy is never overwritten.
   --install   also restart the LaunchAgent ($BUNDLE_ID) if it is loaded
@@ -48,7 +49,7 @@ check_rm_target "$BUNDLE" app || exit 1
 
 if is_dry_run; then
   echo "[dry-run] would compile $REPO/Sources/*.swift into a temp bundle in $OUT_DIR"
-  echo "[dry-run] would write Info.plist (CFBundleIdentifier=$BUNDLE_ID), copy Transition.metal to Resources, codesign"
+  echo "[dry-run] would write Info.plist (CFBundleIdentifier=$BUNDLE_ID), copy Transition.metal to Resources, codesign (identity: ${SIGNING_IDENTITY:-local identity if present, else ad-hoc})"
   echo "[dry-run] would move it to $BUNDLE (replacing any old bundle)"
   echo "[dry-run] would copy Transition.metal to $CONFIG_DIR only if missing (else write Transition.metal.new if it differs)"
   (( INSTALL == 0 )) || echo "[dry-run] would kickstart gui/$(id -u)/$BUNDLE_ID if loaded"
@@ -84,8 +85,23 @@ plutil -lint "$INFO" >/dev/null || die "generated Info.plist is invalid"
 # Shader: bundled copy is the fallback the app loads when the config copy is missing or broken.
 cp "$REPO/Sources/Transition.metal" "$NEW/Contents/Resources/Transition.metal"
 
-# Ad-hoc sign (permissions may re-prompt after rebuilds), then verify.
-codesign --force --sign - --identifier "$BUNDLE_ID" "$NEW"
+# Sign: SIGNING_IDENTITY (name or hash) if set, else the local identity from
+# make-signing-identity.sh if present (stable identity keeps permission grants), else ad-hoc
+# (permissions may re-prompt after rebuilds). The identity's keychain must be in the search list
+# (login is by default); codesign cannot find an untrusted identity via --keychain alone.
+SIGN_ARGS=(--force --identifier "$BUNDLE_ID")
+SIGN_ID="${SIGNING_IDENTITY:-}"
+if [[ -z "$SIGN_ID" ]] && security find-identity -p codesigning 2>/dev/null \
+     | grep -qF "\"$DEFAULT_SIGNING_NAME\""; then
+  SIGN_ID="$DEFAULT_SIGNING_NAME"
+fi
+if [[ -n "$SIGN_ID" ]]; then
+  echo "signing with identity: $SIGN_ID"
+  codesign "${SIGN_ARGS[@]}" --sign "$SIGN_ID" "$NEW" || die "codesign with '$SIGN_ID' failed; existing app left untouched"
+else
+  echo "signing ad-hoc (run scripts/make-signing-identity.sh for a stable identity)"
+  codesign "${SIGN_ARGS[@]}" --sign - "$NEW"
+fi
 codesign --verify "$NEW" || die "codesign verification failed; existing app left untouched"
 
 # Swap in. The old bundle is parked in the stage dir until the new one is in place.

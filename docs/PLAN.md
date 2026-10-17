@@ -21,12 +21,12 @@ third-party wallpaper app and no personal data from the original author.
 
 Review fixes (done).
 
-Wave 3 is next:
+Wave 3:
 
-- Swift 6 strict concurrency.
-- A stable local signing identity.
-- A `NowPlayingSource` seam.
-- `Package.swift` with swift-testing.
+- Spotify session extraction (`MusicSession`) — done.
+- Stable local signing — done.
+- Swift 6 strict concurrency — next.
+- `Package.swift` + swift-testing — next.
 
 ## Phase 1: Extraction (done)
 
@@ -108,7 +108,6 @@ are today):
 |---|---|
 | Playlist of wallpapers / time-of-day switching | Several stacked videos; reuse the transitions between them |
 | Per-display wallpapers | `ScreenWindows` already per screen; renderer needs per-view frame sources |
-| Apple Music support | `com.apple.Music.playerInfo` distributed notification; process tap on `com.apple.Music` |
 | In-app editing of name/subtitle | A control-center tile opening a small glass text editor; write `config.json` |
 | More lyric styles | "Brush reveal" and "Scatter assemble" were prototyped in Claude Design |
 | Live wallpaper switcher | Drag a video onto the gear to run `make-wallpaper.sh` in the background |

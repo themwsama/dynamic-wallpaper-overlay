@@ -4,7 +4,7 @@
 // underneath. A gear at the end of the subtitle row opens the control center,
 // whose tiles toggle the clock, the wallpaper version (with an animated
 // transition), the transition style, the music glow, lyrics and romaji.
-// The overlay renders the wallpaper video itself (Metal). While Spotify plays,
+// The overlay renders the wallpaper video itself (Metal). While music plays,
 // a glow with fire sparks pulses along the bottom edge to its beat, colored
 // by the song's genre.
 // Build: ./build.sh  (Transition.metal compiles at launch)
@@ -30,14 +30,13 @@ struct ScreenWindows {
     let panelTopRight: NSPoint
 }
 
-let AUDIO_TAP_IDLE_GRACE: TimeInterval = 15
 // Display changes arrive in bursts (wake, arrange, resolution); rebuild once they settle
 let SCREEN_REBUILD_DEBOUNCE: TimeInterval = 0.3
 
 final class OverlayController: NSObject {
     private var screens: [ScreenWindows] = []
     private let settings = Settings()
-    private let clock = ClockModel()
+    private let clock = ClockModel(defaultMinutes: TIMER_DEFAULT_MINUTES, maxMinutes: TIMER_MAX_MINUTES)
     private var ticker: Timer?
     private var transitionStyle: TransitionStyle {
         TransitionStyle(rawValue: settings.transitionStyleRaw) ?? Self.defaultTransitionStyle
@@ -47,9 +46,7 @@ final class OverlayController: NSObject {
     // Without the video file or Metal, the overlay runs without the backdrop
     private lazy var renderer: TransitionRenderer? = VideoFrameSource(url: BACKDROP_VIDEO_URL)
         .flatMap { TransitionRenderer(frames: $0, showsEffects: settings.isEffectsVisible) }
-    private let spotify = SpotifyWatcher()
-    private let audioTap = SpotifyAudioTap()
-    private var tapSuspendWork: DispatchWorkItem?
+    private let music = MusicSession()
     private var rebuildWork: DispatchWorkItem?
     private var housekeeping: Timer?
     private lazy var visibility = VisibilityMonitor(backdrops: { [weak self] in self?.screens.compactMap(\.backdrop) ?? [] })
@@ -60,7 +57,7 @@ final class OverlayController: NSObject {
     private lazy var lyrics = LyricsController(
         settings: settings,
         provider: LyricsProvider(cacheDirectory: OVERLAY_DIR.appendingPathComponent("lyrics-cache")),
-        clock: PlaybackClock(source: AppleScriptPositionSource()),
+        clock: music.makePlaybackClock(),
         views: { [weak self] in self?.screens.map(\.lyricsView) ?? [] },
         accent: { [weak self] in self?.glow?.accentColor ?? TEXT_COLOR })
     private lazy var controlCenter = ControlCenterPanel(
@@ -114,70 +111,28 @@ final class OverlayController: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.visibility.reevaluate() }
     }
 
-    // Glow follows Spotify's real audio when the tap is healthy, else its play state
+    // Genre recolors the glow, lyrics follow the track, the glow follows the audio
     private func startMusicGlow() {
-        audioTap.start()
         let glow = GlowController(
-            audioLevels: { [weak self] in
-                guard let self, self.audioTap.isHealthy else { return nil }
-                return self.audioTap.levels
-            },
-            isSpotifyPlaying: { [weak self] in self?.spotify.isPlaying ?? false })
+            audioLevels: { [weak self] in self?.music.audioLevels() },
+            isMusicPlaying: { [weak self] in self?.music.isPlaying ?? false })
         glow.isEnabled = settings.isMusicGlowEnabled
         renderer?.glow = glow
         self.glow = glow
-        spotify.onTrackChange = { [weak self] track in
+        music.onTrack = { [weak self] track in
             guard let self else { return }
-            NSLog("wallpaper-overlay: now playing %@ – %@", track.artist, track.name)
             let info = TrackInfo(trackID: track.id, name: track.name, artist: track.artist, album: track.album)
-            let trackID = track.id
             // A slow lookup must not recolor the glow for a song that's no longer playing
             self.genres.resolve(info) { [weak self] genre, _ in
-                guard self?.spotify.track?.id == trackID else { return }
+                guard self?.music.track?.id == track.id else { return }
                 glow.setGenre(genre)
             }
-            self.lyrics.trackChanged(track, position: self.spotify.lastPosition)
+            self.lyrics.trackChanged(track, position: self.music.lastPosition)
         }
-        spotify.onStateChange = { [weak self] playing in
-            guard let self else { return }
-            self.lyrics.playStateChanged(playing)
-            if !playing && self.spotify.track == nil { self.lyrics.playbackEnded() }
-            self.updateAudioTap(playing: playing)
-        }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            guard let self, app?.bundleIdentifier == SPOTIFY_BUNDLE_ID else { return }
-            self.spotify.reset()
-            self.lyrics.playbackEnded()
-            self.updateAudioTap(playing: false, immediately: true)
-        }
-        updateAudioTap(playing: false)
-        spotify.onPositionUpdate = { [weak self] seconds in self?.lyrics.positionChanged(seconds) }
-        spotify.start()
-        // Pick up a song that was already playing before the overlay started
-        fetchSpotifyNowPlaying { [weak self] info in
-            // Spotify may have quit while the query ran; its answer is stale then
-            guard let self, let info, self.spotify.track == nil,
-                  !NSRunningApplication.runningApplications(withBundleIdentifier: SPOTIFY_BUNDLE_ID).isEmpty else { return }
-            self.spotify.handle(info)
-        }
-    }
-
-    // The audio stream only runs while Spotify plays; a pause keeps it for a
-    // short grace period so quick pause/play doesn't restart it
-    // The tap keeps this suspended state even while it couldn't be built
-    private func updateAudioTap(playing: Bool, immediately: Bool = false) {
-        tapSuspendWork?.cancel()
-        tapSuspendWork = nil
-        if playing {
-            audioTap.resume()
-            return
-        }
-        let work = DispatchWorkItem { [weak self] in self?.audioTap.suspend() }
-        tapSuspendWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + (immediately ? 0 : AUDIO_TAP_IDLE_GRACE), execute: work)
+        music.onPlayState = { [weak self] playing in self?.lyrics.playStateChanged(playing) }
+        music.onPosition = { [weak self] seconds in self?.lyrics.positionChanged(seconds) }
+        music.onEnded = { [weak self] in self?.lyrics.playbackEnded() }
+        music.start()
     }
 
     private func makeTiles() -> [ControlTile] {

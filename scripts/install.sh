@@ -17,7 +17,7 @@ PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 VIDEO_DEFAULT="$CONFIG_DIR/wallpaper-stacked.mp4"
 DOMAIN="gui/$(id -u)"
 
-NAME=""; SUBTITLE=""; VIDEO=""; SAMPLE=0; SET_DESKTOP=0; LOGIN_ITEM=1; FORCE_CONFIG=0
+NAME=""; SUBTITLE=""; VIDEO=""; SAMPLE=0; SET_DESKTOP=0; LOGIN_ITEM=1; FORCE_CONFIG=0; STABLE_SIGNING=0
 
 usage() {
   cat <<USAGE
@@ -30,6 +30,8 @@ Usage: $(basename "$0") [options]
   --set-desktop      also set the still image as the desktop picture
   --no-login-item    do not write/load the LaunchAgent (no start at login)
   --force-config     overwrite an existing config.json
+  --stable-signing   create a local self-signed code-signing identity (once) so rebuilds keep
+                     permission grants; see make-signing-identity.sh
   -h, --help         show this help
 With neither --video nor --sample, an existing wallpaper is kept; otherwise the sample is used.
 DRY_RUN=1 (any value except 0/false/no/off) prints every action without doing it.
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --set-desktop) SET_DESKTOP=1; shift ;;
     --no-login-item) LOGIN_ITEM=0; shift ;;
     --force-config) FORCE_CONFIG=1; shift ;;
+    --stable-signing) STABLE_SIGNING=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -155,6 +158,10 @@ if [[ $LOGIN_ITEM -eq 1 ]] && launchctl print "$DOMAIN/$BUNDLE_ID" >/dev/null 2>
 fi
 
 # --- build
+if [[ $STABLE_SIGNING -eq 1 ]]; then
+  say "ensuring stable local signing identity"
+  run "$REPO/scripts/make-signing-identity.sh"
+fi
 say "building app"
 run "$REPO/scripts/build.sh"
 

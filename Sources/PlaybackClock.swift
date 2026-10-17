@@ -1,5 +1,5 @@
-// Tracks where Spotify is in the current track so lyrics can sync. Anchors on
-// notification positions and a slow AppleScript poll, and interpolates between.
+// Tracks where Spotify is in the current track so lyrics can sync. Anchors
+// on notification positions and a slow AppleScript poll, and interpolates between.
 // The poll needs the Automation permission; without it, only notifications sync,
 // and the poll keeps probing slowly so granting the permission later heals it.
 // Other failures (no current track, a timeout) are transient and keep the fast poll.
@@ -14,7 +14,10 @@ let PLAYBACK_MAX_FAILURES = 3
 let APPLESCRIPT_NOT_AUTHORIZED = -1743
 let APPLESCRIPT_APP_NOT_RUNNING = -600
 
+// Blocking position query for PlaybackClock's slow poll
 protocol SpotifyPositionSource {
+    /// The serial queue every query must run on (scripting APIs aren't thread-safe).
+    var queue: DispatchQueue { get }
     /// Blocking; nil when unavailable.
     func currentPosition() -> TimeInterval?
     /// AppleScript error number of the last failed query, if it had one. Read right
@@ -26,13 +29,25 @@ extension SpotifyPositionSource {
     var lastErrorNumber: Int? { nil }
 }
 
+func isApplicationRunning(_ bundleID: String) -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+}
+
+// Runs a one-line "player position" script against Spotify
 final class AppleScriptPositionSource: SpotifyPositionSource {
-    // NSAppleScript isn't thread-safe: only ever called on SPOTIFY_SCRIPT_QUEUE
+    let queue: DispatchQueue
+    private let source: String
+    // NSAppleScript isn't thread-safe: only ever called on `queue`
     private var script: NSAppleScript?
     private(set) var lastErrorNumber: Int?
 
+    init(script: String, queue: DispatchQueue) {
+        source = script
+        self.queue = queue
+    }
+
     func currentPosition() -> TimeInterval? {
-        let script = self.script ?? NSAppleScript(source: "tell application \"Spotify\" to player position")
+        let script = self.script ?? NSAppleScript(source: source)
         self.script = script
         var error: NSDictionary?
         let result = script?.executeAndReturnError(&error)
@@ -44,9 +59,10 @@ final class AppleScriptPositionSource: SpotifyPositionSource {
 }
 
 final class PlaybackClock {
+    private let appName = "Spotify"
     private let source: SpotifyPositionSource
     private let now: () -> CFTimeInterval
-    private let isSpotifyRunning: () -> Bool
+    private let isAppRunning: () -> Bool
     private let log: (String) -> Void
 
     // All state below is main-thread only
@@ -67,17 +83,17 @@ final class PlaybackClock {
     // Seconds between polls right now: normal while they work, slow while they don't
     var pollInterval: TimeInterval { isAvailable ? PLAYBACK_POLL_INTERVAL : PLAYBACK_RETRY_INTERVAL }
 
+    // `isAppRunning` defaults to asking NSWorkspace about `bundleID`
     init(
+        bundleID: String,
         source: SpotifyPositionSource,
         now: @escaping () -> CFTimeInterval = CACurrentMediaTime,
-        isSpotifyRunning: @escaping () -> Bool = {
-            !NSRunningApplication.runningApplications(withBundleIdentifier: SPOTIFY_BUNDLE_ID).isEmpty
-        },
+        isAppRunning: (() -> Bool)? = nil,
         log: @escaping (String) -> Void = { NSLog("%@", $0) }
     ) {
         self.source = source
         self.now = now
-        self.isSpotifyRunning = isSpotifyRunning
+        self.isAppRunning = isAppRunning ?? { isApplicationRunning(bundleID) }
         self.log = log
     }
 
@@ -109,15 +125,15 @@ final class PlaybackClock {
         return anchorPosition + (now() - anchorTime)
     }
 
-    // Main thread. Queries on the shared Spotify script queue, applies back on main.
+    // Main thread. Queries on the source's script queue, applies back on main.
     // `completion` runs on main once the result was applied or dropped.
     func pollOnce(completion: (() -> Void)? = nil) {
         let startEpoch = epoch
         isPollInFlight = true
-        SPOTIFY_SCRIPT_QUEUE.async { [weak self] in
+        source.queue.async { [weak self] in
             guard let self else { return }
-            // Querying a closed Spotify would launch it
-            let isRunning = self.isSpotifyRunning()
+            // Querying Spotify while it's closed would launch it
+            let isRunning = self.isAppRunning()
             let polled = isRunning ? self.source.currentPosition() : nil
             let errorNumber = polled == nil ? self.source.lastErrorNumber : nil
             DispatchQueue.main.async {
@@ -156,7 +172,7 @@ final class PlaybackClock {
         hasLoggedTransientFailures = false
         guard !isAvailable else { return }
         isAvailable = true
-        log("wallpaper-overlay: Spotify position polling works again")
+        log("wallpaper-overlay: \(appName) position polling works again")
         updateTimer()
     }
 
@@ -167,20 +183,20 @@ final class PlaybackClock {
     private func recordFailure(errorNumber: Int?) {
         consecutiveFailures += 1
         guard consecutiveFailures >= PLAYBACK_MAX_FAILURES, isAvailable else { return }
-        guard let errorNumber, let reason = Self.slowRetryReason(errorNumber) else {
+        guard let errorNumber, let reason = slowRetryReason(errorNumber) else {
             logTransientFailures(errorNumber: errorNumber)
             return
         }
         isAvailable = false
-        log("wallpaper-overlay: Spotify position unavailable (AppleScript error \(errorNumber): \(reason)); "
+        log("wallpaper-overlay: \(appName) position unavailable (AppleScript error \(errorNumber): \(reason)); "
             + "using notification resyncs and probing every \(Int(PLAYBACK_RETRY_INTERVAL))s")
         updateTimer()
     }
 
-    private static func slowRetryReason(_ errorNumber: Int) -> String? {
+    private func slowRetryReason(_ errorNumber: Int) -> String? {
         switch errorNumber {
         case APPLESCRIPT_NOT_AUTHORIZED: return "Automation permission denied"
-        case APPLESCRIPT_APP_NOT_RUNNING: return "Spotify not running"
+        case APPLESCRIPT_APP_NOT_RUNNING: return "\(appName) not running"
         default: return nil
         }
     }
@@ -190,7 +206,7 @@ final class PlaybackClock {
         guard !hasLoggedTransientFailures else { return }
         hasLoggedTransientFailures = true
         let code = errorNumber.map(String.init) ?? "none"
-        log("wallpaper-overlay: Spotify position polls failing (AppleScript error \(code)); still polling every "
+        log("wallpaper-overlay: \(appName) position polls failing (AppleScript error \(code)); still polling every "
             + "\(Int(PLAYBACK_POLL_INTERVAL))s")
     }
 

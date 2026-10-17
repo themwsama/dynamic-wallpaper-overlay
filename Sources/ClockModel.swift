@@ -9,11 +9,19 @@ final class ClockModel {
     private(set) var mode: ClockMode = .stopwatch
     private(set) var isRunning = false
     private(set) var isFinished = false
-    private(set) var timerDuration = TimeInterval(TIMER_DEFAULT_MINUTES * 60)
+    private(set) var timerDuration: TimeInterval
+    private let maxMinutes: Int
     private var startedAt: Date?
     private var accumulated: TimeInterval = 0
     var onChange: (() -> Void)?
     var onFinish: (() -> Void)?
+
+    // Limits come from the caller (Style's TIMER_* constants in the app) so the
+    // model compiles on its own
+    init(defaultMinutes: Int, maxMinutes: Int) {
+        timerDuration = TimeInterval(defaultMinutes * 60)
+        self.maxMinutes = maxMinutes
+    }
 
     private var elapsed: TimeInterval {
         accumulated + (startedAt.map { Date().timeIntervalSince($0) } ?? 0)
@@ -56,7 +64,7 @@ final class ClockModel {
     func adjustDuration(minutes: Int) {
         guard canAdjustDuration else { return }
         let current = Int(timerDuration / 60)
-        timerDuration = TimeInterval(min(max(1, current + minutes), TIMER_MAX_MINUTES) * 60)
+        timerDuration = TimeInterval(min(max(1, current + minutes), maxMinutes) * 60)
         onChange?()
     }
 

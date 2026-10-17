@@ -13,11 +13,22 @@ let LYRICS_DURATION_TOLERANCE: TimeInterval = 3
 let LYRICS_LAST_LINE_FALLBACK_LENGTH: TimeInterval = 5
 // Bumped to 2 when get-without-synced started falling through to search; bumped to 3
 // when search results started being checked against the title and artist, since
-// earlier entries may hold another song's lyrics. Older entries are ignored.
-let LYRICS_CACHE_VERSION = 3
+// earlier entries may hold another song's lyrics; bumped to 4 when plain-only songs
+// started getting estimated timing, so ones cached as "none" are asked about again.
+// Older entries are ignored.
+let LYRICS_CACHE_VERSION = 4
 // Waits before the 2nd and 3rd attempt of a request that failed transiently
 let LYRICS_RETRY_DELAYS: [TimeInterval] = [1.5, 4]
 let LYRICS_CACHE_NAME_MAX = 80
+// Estimated timing for plain (untimed) lyrics: lines are spread over the song between
+// an intro and an outro margin, each slot weighted by the line's length
+let LYRICS_ESTIMATE_INTRO_MAX: TimeInterval = 12
+let LYRICS_ESTIMATE_INTRO_SHARE = 0.08
+let LYRICS_ESTIMATE_OUTRO_MAX: TimeInterval = 10
+let LYRICS_ESTIMATE_OUTRO_SHARE = 0.06
+let LYRICS_ESTIMATE_MIN_WEIGHT = 8  // characters; shorter lines count as this many
+let LYRICS_ESTIMATE_MAX_LINES = 120
+let LYRICS_ESTIMATE_UNKNOWN_DURATION_LINE: TimeInterval = 3.5
 
 struct LyricWord: Codable, Equatable { let start: TimeInterval; let text: String }
 
@@ -30,6 +41,20 @@ struct LyricLine: Codable, Equatable {
 
 struct TimedLyrics: Codable, Equatable {
     let lines: [LyricLine]
+    // True when the timing was guessed from plain lyrics, so lines are only roughly in step
+    let isEstimated: Bool
+
+    init(lines: [LyricLine], isEstimated: Bool = false) {
+        self.lines = lines
+        self.isEstimated = isEstimated
+    }
+
+    // Entries written before the field existed decode as exact timing
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        lines = try container.decode([LyricLine].self, forKey: .lines)
+        isEstimated = try container.decodeIfPresent(Bool.self, forKey: .isEstimated) ?? false
+    }
 
     // Index of the line whose [start, end) holds the position; nil before the
     // first line, after the last, or in a hole
@@ -67,7 +92,10 @@ private enum HTTPResult {
 }
 
 private enum ExactOutcome {
-    case found(TimedLyrics), instrumental, needsSearch, failed
+    case found(TimedLyrics), instrumental, failed
+    // `plainFallback` is the get result's plain text with estimated timing, used only if
+    // search finds nothing better
+    case needsSearch(plainFallback: TimedLyrics?)
 }
 
 // `failed` is transient (network, LRCLIB overloaded): ask again later, it's not an answer
@@ -146,6 +174,42 @@ final class LyricsProvider {
             return LyricLine(start: line.start, end: end, text: line.text, words: line.words)
         }
         return TimedLyrics(lines: lines)
+    }
+
+    // MARK: Estimated timing
+
+    // Plain lyrics carry no times, so lines are spread over the song: after an intro,
+    // before an outro, each slot as long as its share of the characters (short lines
+    // count as LYRICS_ESTIMATE_MIN_WEIGHT so they don't flash by). Slots touch, so there
+    // are no gap lines. Without a duration every line gets a fixed slot. Beyond
+    // LYRICS_ESTIMATE_MAX_LINES only the first lines are kept, spread over the whole song.
+    static func estimateTiming(plain: String, duration: TimeInterval?) -> TimedLyrics? {
+        let texts = plain.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .prefix(LYRICS_ESTIMATE_MAX_LINES)
+        guard !texts.isEmpty else { return nil }
+        guard let duration, duration > 0, duration.isFinite else {
+            let lines = texts.enumerated().map { index, text in
+                LyricLine(start: Double(index) * LYRICS_ESTIMATE_UNKNOWN_DURATION_LINE,
+                          end: Double(index + 1) * LYRICS_ESTIMATE_UNKNOWN_DURATION_LINE, text: text, words: nil)
+            }
+            return TimedLyrics(lines: lines, isEstimated: true)
+        }
+        let intro = min(LYRICS_ESTIMATE_INTRO_MAX, duration * LYRICS_ESTIMATE_INTRO_SHARE)
+        let outro = min(LYRICS_ESTIMATE_OUTRO_MAX, duration * LYRICS_ESTIMATE_OUTRO_SHARE)
+        let span = duration - intro - outro
+        let weights = texts.map { Double(max(LYRICS_ESTIMATE_MIN_WEIGHT, $0.count)) }
+        let totalWeight = weights.reduce(0, +)
+        var elapsed = 0.0
+        var lines: [LyricLine] = []
+        for (text, weight) in zip(texts, weights) {
+            let start = intro + span * elapsed / totalWeight
+            elapsed += weight
+            let end = intro + span * elapsed / totalWeight
+            lines.append(LyricLine(start: start, end: end, text: text, words: nil))
+        }
+        return TimedLyrics(lines: lines, isEstimated: true)
     }
 
     // Seconds to shift timing by; positive offset makes lyrics appear sooner
@@ -273,40 +337,59 @@ final class LyricsProvider {
                 switch Self.outcome(fromExact: data, duration: duration) {
                 case .found(let lyrics): finish(key, .found(lyrics))
                 case .instrumental: finish(key, .none)
-                case .needsSearch: fetchSearch(key: key, artist: artist, title: title, duration: duration)
+                case .needsSearch(let plainFallback):
+                    fetchSearch(key: key, artist: artist, title: title, duration: duration, plainFallback: plainFallback)
                 case .failed: finish(key, .failed)
                 }
-            case .notFound: fetchSearch(key: key, artist: artist, title: title, duration: duration)
+            case .notFound: fetchSearch(key: key, artist: artist, title: title, duration: duration, plainFallback: nil)
             case .failed, .retryable: finish(key, .failed)
             }
         }
     }
 
-    // Reached only after get gave no usable lyrics; a 200 here with nothing usable is the
-    // one definitive miss that gets a negative cache entry
-    private func fetchSearch(key: String, artist: String, title: String, duration: TimeInterval?) {
+    // Reached only after get gave no synced lyrics; a 200 here with nothing usable is the
+    // one definitive miss that gets a negative cache entry. Synced lyrics from search beat
+    // get's plain text; with neither, the plain text (if any) is used.
+    private func fetchSearch(key: String, artist: String, title: String, duration: TimeInterval?,
+                             plainFallback: TimedLyrics?) {
         guard let url = Self.url(path: "search", query: [("track_name", title), ("artist_name", artist)]) else {
             return finish(key, .failed)
         }
         request(url, label: "lyrics search") { [self] result in
             switch result {
-            case .ok(let data): finish(key, Self.outcome(fromSearch: data, artist: artist, title: title, duration: duration))
-            case .notFound: finish(key, .none)
+            case .ok(let data):
+                let found = Self.outcome(fromSearch: data, artist: artist, title: title, duration: duration)
+                finish(key, Self.preferringFallback(found, plainFallback))
+            case .notFound: finish(key, plainFallback.map { .found($0) } ?? .none)
             case .failed, .retryable: finish(key, .failed)
             }
         }
     }
 
-    // Only instrumental: true ends the chain; plain-only or empty goes on to search
+    // Search's estimated lyrics lose to get's (an exact-signature match); a miss falls back
+    private static func preferringFallback(_ outcome: LookupOutcome, _ fallback: TimedLyrics?) -> LookupOutcome {
+        guard let fallback else { return outcome }
+        switch outcome {
+        case .found(let lyrics) where !lyrics.isEstimated: return outcome
+        case .found, .none: return .found(fallback)
+        case .failed: return .failed
+        }
+    }
+
+    // Only instrumental: true ends the chain; plain-only or empty goes on to search,
+    // carrying the plain text along as a fallback
     private static func outcome(fromExact data: Data, duration: TimeInterval?) -> ExactOutcome {
         guard let track = try? JSONDecoder().decode(LRCLibTrack.self, from: data) else {
             NSLog("wallpaper-overlay: lyrics get response was not understood")
             return .failed
         }
         if track.instrumental == true { return .instrumental }
-        guard let synced = track.syncedLyrics, !synced.isEmpty,
-              let lyrics = parseLRC(synced, duration: duration ?? track.duration) else { return .needsSearch }
-        return .found(lyrics)
+        let length = duration ?? track.duration
+        if let synced = track.syncedLyrics, !synced.isEmpty, let lyrics = parseLRC(synced, duration: length) {
+            return .found(lyrics)
+        }
+        let plain = track.plainLyrics.flatMap { estimateTiming(plain: $0, duration: length) }
+        return .needsSearch(plainFallback: plain)
     }
 
     // A search hit is trusted only when it is the same song: the title must match after
@@ -323,25 +406,35 @@ final class LyricsProvider {
         let wantedArtist = normalizedMatchKey(artist)
         guard !wantedTitle.isEmpty else { return .none }
         let candidates = tracks.filter { track in
-            guard track.instrumental != true, !(track.syncedLyrics ?? "").isEmpty,
-                  normalizedMatchKey(track.trackName ?? "") == wantedTitle else { return false }
+            guard track.instrumental != true, normalizedMatchKey(track.trackName ?? "") == wantedTitle else { return false }
             return isSameArtist(track, wantedArtist) || isCloseInLength(track, duration)
         }
-        // Same-artist results beat length-only matches
+        // Synced beats plain among acceptable results; plain only if nothing synced parses
+        let synced = candidates.filter { !($0.syncedLyrics ?? "").isEmpty }
+        if let pick = bestMatch(synced, wantedArtist: wantedArtist, duration: duration),
+           let lyrics = parseLRC(pick.syncedLyrics ?? "", duration: duration ?? pick.duration) {
+            return .found(lyrics)
+        }
+        let plain = candidates.filter { !($0.plainLyrics ?? "").isEmpty }
+        if let pick = bestMatch(plain, wantedArtist: wantedArtist, duration: duration),
+           let lyrics = estimateTiming(plain: pick.plainLyrics ?? "", duration: duration ?? pick.duration) {
+            return .found(lyrics)
+        }
+        return .none
+    }
+
+    // Same-artist results beat length-only matches; with a known duration the closest
+    // length within tolerance wins, otherwise the first acceptable result
+    private static func bestMatch(_ candidates: [LRCLibTrack], wantedArtist: String,
+                                  duration: TimeInterval?) -> LRCLibTrack? {
         let sameArtist = candidates.filter { isSameArtist($0, wantedArtist) }
         let pool = sameArtist.isEmpty ? candidates : sameArtist
-        var pick = pool.first
-        if let duration {
-            // Closest length wins, if within tolerance; otherwise the first acceptable result
-            let close = pool
-                .compactMap { track in track.duration.map { (track, abs($0 - duration)) } }
-                .filter { $0.1 <= LYRICS_DURATION_TOLERANCE }
-                .min { $0.1 < $1.1 }
-            pick = close?.0 ?? pick
-        }
-        guard let pick, let lyrics = parseLRC(pick.syncedLyrics ?? "", duration: duration ?? pick.duration)
-        else { return .none }
-        return .found(lyrics)
+        guard let duration else { return pool.first }
+        let close = pool
+            .compactMap { track in track.duration.map { (track, abs($0 - duration)) } }
+            .filter { $0.1 <= LYRICS_DURATION_TOLERANCE }
+            .min { $0.1 < $1.1 }
+        return close?.0 ?? pool.first
     }
 
     private static func isSameArtist(_ track: LRCLibTrack, _ wanted: String) -> Bool {

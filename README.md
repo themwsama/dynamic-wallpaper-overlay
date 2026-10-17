@@ -12,7 +12,8 @@ third-party wallpaper app needed.
 - **A gear button** opening a glass control center: clock, wallpaper look,
   transition style, glow, lyrics, romaji
 - **Spotify:** the glow pulses with the real beat, colored by the song's genre;
-  sparks fly at the song's tempo; lyrics animate in the lower-left
+  sparks fly at the song's tempo; lyrics animate in the lower-left (plain-text
+  lyrics get estimated timing and an "approximate" marker)
 - **Light on resources:** about 200 MB, pauses when the screen sleeps or is
   covered, and caps at 30 fps in Low Power Mode
 
@@ -32,7 +33,7 @@ scripts/install.sh --name "YOUR NAME" --subtitle "WHAT YOU DO" --video ~/Movies/
 scripts/install.sh --name "YOUR NAME" --subtitle "WHAT YOU DO" --sample
 ```
 
-Add `DRY_RUN=1` in front to preview.
+Add `DRY_RUN=1` in front to preview. Add `--stable-signing` to keep macOS permission grants across rebuilds (creates a local self-signed signing identity).
 
 **What to expect:** the first install takes 2-3 minutes at high CPU while it
 encodes the wallpaper. The encoded wallpaper is about 25 MB. The app build takes

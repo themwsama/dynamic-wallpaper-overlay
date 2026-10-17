@@ -40,6 +40,15 @@ check("minimum is shared between rows", near(shortTwo[0].duration + shortTwo[1].
 
 check("no rows gives no slots", sweepSchedule(rowLengths: [], now: 0, entryDelay: 0, lineDuration: 5).isEmpty)
 check("empty rows give no slots", sweepSchedule(rowLengths: [0, 0], now: 0, entryDelay: 0, lineDuration: 5).isEmpty)
+// Estimated lyrics: no sweep, whatever the line looks like; synced lyrics unchanged
+for (rows, delay, duration) in [([20], 0.56, 5.0), ([30, 10], 0.5, 8.8), ([8], 0, 0.6)] as [([Int], Double, Double)] {
+    let estimated = lineSweepSchedule(isEstimated: true, rowLengths: rows, now: 100, entryDelay: delay, lineDuration: duration)
+    let synced = lineSweepSchedule(isEstimated: false, rowLengths: rows, now: 100, entryDelay: delay, lineDuration: duration)
+    check("estimated \(rows) schedules no sweep", estimated.isEmpty)
+    check("synced \(rows) schedule matches sweepSchedule", synced == sweepSchedule(rowLengths: rows, now: 100, entryDelay: delay, lineDuration: duration) && synced.count == rows.count)
+}
+check("estimated opacity is 0.85 of normal", LYRICS_ESTIMATED_OPACITY == 0.85)
+check("estimated marker constant", LYRICS_ESTIMATED_MARKER.contains("approximate") && LYRICS_ESTIMATED_MARKER_ALPHA == 0.5)
 check("constants", LYRICS_SWEEP_TAIL == 0.3 && LYRICS_SWEEP_MIN_DURATION == 0.5)
 
 if failures > 0 { print("\(failures) failed"); exit(1) }

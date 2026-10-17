@@ -1,4 +1,4 @@
-// Assert-style tests for SpotifyWatcher parsing and change callbacks.
+// Assert-style tests for SpotifyWatcher parsing, change callbacks and its injected seams.
 import Foundation
 import QuartzCore
 
@@ -111,6 +111,62 @@ check("same track after reset counts as a new track", replayed == 1)
 
 w.start(); w.stop()
 check("start/stop do not crash", true)
+
+// Identity
+check("position source runs on the shared script queue", SpotifyWatcher().makePositionSource().queue === SPOTIFY_SCRIPT_QUEUE)
+check("scripts target Spotify", SpotifyWatcher().positionScript.contains("\"Spotify\"")
+      && SpotifyWatcher().nowPlayingScript.contains("\"Spotify\""))
+let aw = SpotifyWatcher()
+var applied: [String] = []
+aw.onTrackChange = { _ in applied.append("track") }
+aw.onPositionUpdate = { _ in applied.append("position") }
+aw.onStateChange = { _ in applied.append("state") }
+aw.apply(SpotifySnapshot(track: SpotifyTrack(id: "spotify:track:a1", name: "N", artist: "A", album: "B", duration: 10),
+                            isPlaying: true, position: 1.5))
+check("apply behaves like a notification", applied == ["track", "position", "state"]
+      && aw.track?.id == "spotify:track:a1" && aw.lastPosition?.seconds == 1.5 && aw.isPlaying)
+
+// Injected notification center: start() listens for Spotify's broadcast, stop() detaches
+let center = NotificationCenter()
+let cw = SpotifyWatcher(center: center)
+var centerTracks: [String] = []
+cw.onTrackChange = { centerTracks.append($0.id) }
+cw.start()
+cw.start()
+center.post(name: SPOTIFY_NOTIFICATION, object: nil, userInfo: info("Playing", "spotify:track:n1"))
+RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+check("notification on the injected center is handled once", centerTracks == ["spotify:track:n1"])
+center.post(name: SPOTIFY_NOTIFICATION, object: nil)
+RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+check("notification without userInfo is ignored", centerTracks.count == 1 && cw.isPlaying)
+cw.stop()
+center.post(name: SPOTIFY_NOTIFICATION, object: nil, userInfo: info("Playing", "spotify:track:n2"))
+RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+check("stop detaches from the center", centerTracks.count == 1)
+
+// fetchNowPlaying: injected app-running check and script runner
+func fetch(running: Bool, output: String?, error: NSDictionary? = nil) -> (snapshot: SpotifySnapshot?, ran: [String], asked: [String]) {
+    var ran: [String] = []
+    var asked: [String] = []
+    let f = SpotifyWatcher(runScript: { ran.append($0); return (output, error) },
+                           isAppRunning: { asked.append($0); return running })
+    var done = false
+    var result: SpotifySnapshot?
+    f.fetchNowPlaying { result = $0; done = true }
+    let end = Date().addingTimeInterval(5)
+    while !done && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.005)) }
+    return (result, ran, asked)
+}
+let live = fetch(running: true, output: "playing\nspotify:track:f1\nN\nA\nB\n215000\n12.5")
+check("fetch parses the script output", live.snapshot?.isPlaying == true && live.snapshot?.track?.id == "spotify:track:f1"
+      && live.snapshot?.position == 12.5 && live.snapshot?.track?.duration == 215)
+check("fetch asks about Spotify's bundle ID and runs the now-playing script",
+      live.asked == [SPOTIFY_BUNDLE_ID] && live.ran == [SpotifyWatcher().nowPlayingScript])
+let closed = fetch(running: false, output: "playing\nspotify:track:f1\nN\nA\nB\n1\n2")
+check("fetch while Spotify is closed runs no script", closed.snapshot == nil && closed.ran.isEmpty)
+check("fetch with unreadable output yields nil", fetch(running: true, output: nil).snapshot == nil)
+check("fetch with a script error yields nil",
+      fetch(running: true, output: nil, error: [NSAppleScript.errorNumber: -1743] as NSDictionary).snapshot == nil)
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")
