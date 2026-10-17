@@ -66,7 +66,16 @@ func containsJapanese(_ text: String) -> Bool {
     text.unicodeScalars.contains { (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) }
 }
 
-final class LyricsView: NSView {
+// What LyricsController drives. LyricsView is the real one; tests record the calls instead.
+protocol LyricsDisplay: AnyObject {
+    func setVisible(_ visible: Bool)
+    func clear()
+    func removeLine()
+    func show(text: String, romaji: String?, duration: TimeInterval, accent: NSColor, reducedMotion: Bool,
+              isEstimated: Bool)
+}
+
+final class LyricsView: NSView, LyricsDisplay {
     private let root = CALayer()
     private var current: CALayer?
 
