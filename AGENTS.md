@@ -141,7 +141,7 @@ All of these sit **behind** normal app windows, like a real wallpaper:
 | Feature | Behaviour |
 |---|---|
 | **Video wallpaper** | Seamless loop rendered with Metal, aspect-filled to every display |
-| **Two looks + transitions** | "Glass" (blurred, tinted, iOS-like) or "Original"; switching plays an animated transition: *Storm rewind* (gold clock face, clockwise sweep, upward rain), *World-line shift* (nixie-tube digits and an RGB-split glitch) or a crossfade |
+| **Two looks + transitions** | "Glass" (blurred, tinted, iOS-like) or "Original"; switching plays an animated transition: *Storm rewind* (gold clock face, clockwise sweep, upward rain), *World-line shift* (nixie-tube digits and an RGB-split glitch), *Worldline 2* (white mathematical diagrams, perspective zoom, geometric breakup and glitch), or a crossfade |
 | **Name block** | Large serif name, a hairline rule, and the subtitle, anchored to each screen's top-right corner at a fixed margin (not baked into the video) |
 | **Gear + control center** | A glass gear at the end of the subtitle row opens an iOS-style tile grid: Clock, Glass/Original, transition style, Glow, Lyrics, Romaji, and a Low power indicator. Clicking outside closes it. |
 | **Clock card** | Glass stopwatch / countdown timer under the name; it slides out of the way when the control center opens |
@@ -184,7 +184,7 @@ audio permission again after rebuilding. Re-allow it in System Settings.
 | `ClockModel.swift`, `ClockView.swift` | Stopwatch/timer logic (timer limits injected) and the glass card; `GlassButton`, `makeGlassCard` (Liquid Glass with a blur fallback) |
 | `VideoFrames.swift` | One `AVPlayerItem` looped by seek; frames as 4:2:0 `CVPixelBuffer`s |
 | `TransitionRenderer.swift` | `MTKView` delegate per screen: uploads the luma/chroma planes, fills uniforms, plays transitions, frame-rate policy |
-| `Transition.metal` | All GPU visuals: YUV→RGB, aspect fill, the three transitions, music glow, fire sparks. **Compiled at launch** from `~/.config/wallpaper-overlay/Transition.metal` |
+| `Transition.metal` | All GPU visuals: YUV→RGB, aspect fill, four transitions, music glow, fire sparks. **Compiled at launch** from the user shader when compatible, with the bundled shader supplying Worldline 2 for older custom copies. |
 | `DigitAtlas.swift` | Nixie-tube digit texture (sharp + glow channels) |
 | `GlowController.swift` | Glow presence/energy/beat/colors per frame; genre → look table |
 | `SpotifyWatcher.swift` | Spotify distributed notifications (`com.spotify.client.PlaybackStateChanged`, no permission); the launch-time now-playing AppleScript query; the shared Spotify script queue (`SPOTIFY_BUNDLE_ID`) |
@@ -192,7 +192,7 @@ audio permission again after rebuilding. Re-allow it in System Settings.
 | `MusicSession.swift` | Owns `SpotifyWatcher` and `SpotifyAudioTap`, the 15 s pause grace period, the launch bootstrap and the Spotify-quit observer; `main.swift` wires it to genre, lyrics and glow |
 | `AudioAnalyzer.swift` | Real-time-safe loudness, bass, beat onsets, tempo (median beat gap, folded into 60–180 BPM) |
 | `GenreResolver.swift` | Track → genre bucket: cache, then iTunes Search (free, no key), then Spotify Web API (optional keys), then Gemini (optional key) |
-| `LyricsProvider.swift` | LRCLIB client (`/api/get`, falling back to `/api/search`; plain-only lyrics get estimated timing), LRC parser, retries, on-disk cache (`cachedLyrics(trackID:)` peeks without the network), per-track `cancel(trackID:)` of the in-flight request and retry timer (never caches, never completes anyone), offline romaji via `CFStringTokenizer` |
+| `LyricsProvider.swift` | LRCLIB client (`/api/get` and `/api/search` raced in parallel, first acceptable synced result wins; jittered retries on 5xx/429 within an 8 s budget; a circuit breaker skips `get` for 60 s after repeated 5xx; plain-only lyrics get estimated timing), LRC parser, retries, on-disk cache (`cachedLyrics(trackID:)` peeks without the network), per-track `cancel(trackID:)` of the in-flight request and retry timer (never caches, never completes anyone), offline romaji via `CFStringTokenizer` |
 | `PlaybackClock.swift` | Interpolated playback position; polls Spotify every 2 s while playing. Bundle ID and position source are injected, with no globals |
 | `LyricsController.swift` | Picks the current line, drives `LyricsView`. Waits `LYRICS_FETCH_DEBOUNCE` (0.6 s) before a network lookup, applies cache hits at once, cancels a skipped track's network work, and shows the track title and artist while a lookup is pending and in the intro before the first line |
 | `LyricsView.swift` | Core Animation kinetic text: per-character rise/blur-in, karaoke sweep, two-row wrap; `showPlaceholder(title:artist:)` for the dim title/artist box |
@@ -436,7 +436,7 @@ wallpaper-overlay: wallpaper hidden, pausing and releasing frames
 | Glow ignores the beat | Audio permission denied or reset by a rebuild | Re-allow "System Audio Recording Only" for Wallpaper Overlay. With no audio for 3 s, the glow falls back to the genre's tempo automatically |
 | Glow stops reacting after an audio device change | Audio device changed under the process tap | The tap rebuilds automatically; no action needed. Check the log if it doesn't recover |
 | Glow color never changes | Genre lookup failed | Log `genre ... (fallback)`. iTunes may rate-limit (~20/min); add Spotify/Gemini keys for fallbacks |
-| No lyrics for one song | LRCLIB has no synced version, or was briefly down (503, retried twice) | Log shows `lyrics ...: none`; expected for niche tracks |
+| No lyrics for one song | LRCLIB has no synced version, or LRCLIB is having a 503 spike (both endpoints are raced and retried within 8 s; failures are never cached) | Log shows `lyrics ...: none` or `unavailable`; the next play retries. Expected for niche tracks |
 | Lyrics out of sync after seeking | Spotify Automation permission denied | Allow "control Spotify" for Wallpaper Overlay |
 | Nothing for a song already playing at launch | Spotify wasn't running at launch | Play/skip once; the notification picks it up |
 | Memory in the GBs | Do not convert frames to BGRA or create one video output per looping item | Keep `VideoFrames.swift`'s single item + 4:2:0 design |

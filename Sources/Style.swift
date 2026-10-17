@@ -62,6 +62,7 @@ let VIDEO_SIZE = NSSize(width: 2560, height: 1440)  // one half of the stacked f
 let CROSSFADE_DURATION: CFTimeInterval = 0.9
 let STORM_REWIND_DURATION: CFTimeInterval = 1.8
 let WORLD_LINE_SHIFT_DURATION: CFTimeInterval = 1.4
+let WORLD_LINE_2_DURATION: CFTimeInterval = 3.3
 let IDLE_FPS = 30  // the video's own frame rate
 let TRANSITION_FPS = 60
 // Shown on the nixie tubes in the world-line shift transition

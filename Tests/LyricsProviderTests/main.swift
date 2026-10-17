@@ -186,7 +186,11 @@ do {
 }
 do {
     resetStub { _ in (200, json(["plainLyrics": "plain only", "instrumental": false])) }
-    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) == nil, "plain-only get with an undecodable search nil")
+    // Raced endpoints: an unusable search reply counts as that endpoint failing, so get's plain
+    // text is used, estimated, and not cached
+    let undecodableDir = tmpDir()
+    let undecodable = fetch(LyricsProvider(cacheDirectory: undecodableDir, session: session, retryDelays: [0, 0]))
+    check(undecodable?.isEstimated == true && undecodable?.lines.first?.text == "plain only" && cacheFiles(undecodableDir).isEmpty, "plain-only get with an undecodable search: plain used, estimated, not cached")
     resetStub { _ in (200, json(["instrumental": true, "syncedLyrics": lrcA])) }
     check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) == nil, "instrumental nil")
 }
@@ -202,7 +206,7 @@ do {
     check(fetch(p) == nil && reqCount() == 2, "negative cache hit within 7 days")
     clock = clock.addingTimeInterval(2 * 24 * 3600)
     resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
-    check(fetch(p)?.lines.count == 2 && reqCount() == 1, "negative cache expired, refetched")
+    check(fetch(p)?.lines.count == 2 && reqCount() == 2, "negative cache expired, refetched (get and search raced)")
 }
 do {
     // network errors and 500 not cached
@@ -224,7 +228,7 @@ do {
         p.lyrics(trackID: "dup", artist: "a", title: "t", album: "al", duration: nil) { results.append(lyricsOf($0)) }
     }
     spin { results.count == 3 }
-    check(results.count == 3 && results.allSatisfy { $0 != nil } && reqCount() == 1, "in-flight dedup")
+    check(results.count == 3 && results.allSatisfy { $0 != nil } && reqCount() == 2, "in-flight dedup: one lookup, get and search once each")
 }
 do {
     check(LyricsProvider.cacheFileName(for: "spotify:track:abc") != LyricsProvider.cacheFileName(for: "spotify_track_abc"), "file names collision-free")
@@ -250,7 +254,7 @@ do {
 do {
     resetStub { _ in (200, json(["instrumental": true])) }
     let dir = tmpDir()
-    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && reqCount() == 1, "get instrumental: no search")
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && reqCount() == 2, "get instrumental: none (search was raced, its answer is not needed)")
     check(cacheFiles(dir).count == 1, "instrumental negative cached")
 }
 do {
@@ -273,29 +277,29 @@ do {
 }
 do {
     let n = Counter()
-    resetStub { r in n.next() == 1 ? (503, Data()) : (200, json(["syncedLyrics": lrcA])) }
-    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) != nil && reqCount() == 2, "503 then 200 retried")
+    resetStub { r in isGet(r) ? (n.next() == 1 ? (503, Data()) : (200, json(["syncedLyrics": lrcA]))) : (404, Data()) }
+    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) != nil && reqCount() == 3, "503 then 200 retried (get twice, search once)")
 }
 do {
     resetStub { _ in (503, Data()) }
     let dir = tmpDir()
     check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil, "three 503s nil")
-    check(reqCount() == 3 && cacheFiles(dir).isEmpty, "3 attempts, no negative cache file")
+    check(reqCount() == 6 && cacheFiles(dir).isEmpty, "3 attempts per endpoint, no negative cache file")
     resetStub { _ in (429, Data()) }
     _ = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
-    check(reqCount() == 3, "429 retried")
+    check(reqCount() == 6, "429 retried")
     resetStub { _ in (400, Data()) }
     _ = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
-    check(reqCount() == 1, "400 not retried")
+    check(reqCount() == 2, "400 not retried")
 }
 do {
     let n = Counter()
-    resetStub { _ in n.next() == 1 ? nil : (200, json(["syncedLyrics": lrcA])) }
-    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) != nil && reqCount() == 2, "URL error retried")
-    // search retries too; get plain-only then search 503 x3 -> no cache
+    resetStub { r in isGet(r) ? (n.next() == 1 ? nil : (200, json(["syncedLyrics": lrcA]))) : (404, Data()) }
+    check(fetch(LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0])) != nil && reqCount() == 3, "URL error retried")
+    // search retries too; get plain-only then search 503 x3 -> plain shown, nothing cached
     resetStub { r in isGet(r) ? (200, json(["plainLyrics": "p"])) : (503, Data()) }
     let dir = tmpDir()
-    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && cacheFiles(dir).isEmpty && reqCount() == 4, "search retried, failure not cached")
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))?.isEstimated == true && cacheFiles(dir).isEmpty && reqCount() == 4, "search retried, partial answer not cached")
 }
 do {
     // old-version cache ignored
@@ -305,7 +309,7 @@ do {
     let old: [String: Any] = ["version": 1, "fetchedAt": Date().timeIntervalSince1970]
     try! json(old).write(to: dir.appendingPathComponent(name))
     resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
-    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) != nil && reqCount() == 1, "old-version cache ignored")
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) != nil && reqCount() == 2, "old-version cache ignored")
 }
 do {
     // negative cache only after definitive search miss
@@ -365,7 +369,7 @@ do {
     try! json(wrong).write(to: dir.appendingPathComponent(LyricsProvider.cacheFileName(for: "t1")))
     resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
     let l = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
-    check(LYRICS_CACHE_VERSION == 4 && l?.lines.first?.text == "paper lanterns drift over the river" && reqCount() == 1, "version 2 cache entry dropped")
+    check(LYRICS_CACHE_VERSION == 4 && l?.lines.first?.text == "paper lanterns drift over the river" && reqCount() == 2, "version 2 cache entry dropped")
 }
 
 // MARK: estimated timing
@@ -460,7 +464,7 @@ do {
     // instrumental: none, no search for get; flagged search results are skipped
     resetStub { _ in (200, json(["instrumental": true, "plainLyrics": plainText])) }
     let dir = tmpDir()
-    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && reqCount() == 1 && cacheFiles(dir).count == 1, "instrumental with plain text: none")
+    check(fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])) == nil && reqCount() == 2 && cacheFiles(dir).count == 1, "instrumental with plain text: none")
     check(isNone(searchResult(results: [plainHit(instrumental: true)])), "instrumental search result with plain text: none")
 }
 do {
@@ -518,15 +522,15 @@ do {
     let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])
     var calls: [String] = []
     lookup(p, id: "c1", title: "Cancel One") { calls.append("c1 \(outcomeName($0))") }
-    spin { requestCount(containing: "Cancel%20One") == 1 }
+    spin { requestCount(containing: "Cancel%20One") == 2 }  // get and search
     p.cancel(trackID: "c1")
-    spin { stoppedCount() == 1 }
-    check(stoppedCount() == 1, "cancel: the in-flight URLSessionTask is cancelled")
+    spin { stoppedCount() == 2 }
+    check(stoppedCount() == 2, "cancel: both in-flight URLSessionTasks are cancelled")
     Stub.releaseHeld()
     wait(0.3)
     check(calls.isEmpty, "cancel in flight: no completion side effects")
     check(cacheFiles(dir).isEmpty && p.cachedLyrics(trackID: "c1") == nil, "cancel in flight: no negative cache entry")
-    check(reqCount() == 1, "cancel in flight: no retry or follow-up request")
+    check(reqCount() == 2, "cancel in flight: no retry or follow-up request")
 }
 do {
     // other tracks' waiters are unaffected by a cancel, and a cancelled id can be asked again
@@ -538,14 +542,14 @@ do {
     lookup(p, id: "c1", title: "Cancel One") { calls.append("c1 \(outcomeName($0))") }
     lookup(p, id: "c2", title: "Cancel Two") { calls.append("c2 \(outcomeName($0))") }
     lookup(p, id: "c2", title: "Cancel Two") { calls.append("c2b \(outcomeName($0))") }  // a second waiter, same id
-    spin { requestCount(containing: "Cancel%20One") == 1 && requestCount(containing: "Cancel%20Two") == 1 }
+    spin { requestCount(containing: "Cancel%20One") == 2 && requestCount(containing: "Cancel%20Two") == 2 }
     p.cancel(trackID: "c1")
     Stub.holdMatching = []
     Stub.releaseHeld()
     spin { calls.count == 2 }
     check(calls.sorted() == ["c2 found", "c2b found"], "cancel: other track's waiters still complete, the cancelled one doesn't")
     check(cacheFiles(dir).count == 1 && p.cachedLyrics(trackID: "c2") != nil, "cancel: only the other track was cached")
-    check(requestCount(containing: "Cancel%20Two") == 1, "cancel: other track's request not repeated")
+    check(requestCount(containing: "Cancel%20Two") == 2, "cancel: other track's requests not repeated")
     // asking about the cancelled id again starts fresh and completes normally
     var again: LookupOutcome?
     lookup(p, id: "c1", title: "Cancel One") { again = $0 }
@@ -562,17 +566,22 @@ do {
     let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0.4, 0.4])
     var calls = 0
     lookup(p, id: "c1", title: "Cancel One") { _ in calls += 1 }
-    spin { reqCount() == 1 }
-    wait(0.1)  // the 503 is in; the retry timer waits
+    spin { reqCount() == 2 }
+    wait(0.1)  // both 503s are in; the retry timers wait
     p.cancel(trackID: "c1")
     wait(1.2)  // well past both retry delays
-    check(reqCount() == 1, "cancel during a retry wait: the retry never fires")
+    check(reqCount() == 2, "cancel during a retry wait: the retry never fires")
     check(calls == 0, "cancel during a retry wait: no completion")
     check(cacheFiles(dir).isEmpty, "cancel during a retry wait: no negative cache entry")
 }
 do {
     // a retry timer for one track keeps running while another track is cancelled
-    resetStub { r in r.url!.absoluteString.contains("Cancel%20Two") && Stub.requests.filter({ $0.url!.absoluteString.contains("Cancel%20Two") }).count == 1 ? (503, Data()) : (200, json(["syncedLyrics": lrcA])) }
+    let twoGets = Counter()
+    resetStub { r in
+        if !isGet(r) { return (404, Data()) }
+        let isFirstTwoGet = r.url!.absoluteString.contains("Cancel%20Two") && twoGets.next() == 1
+        return isFirstTwoGet ? (503, Data()) : (200, json(["syncedLyrics": lrcA]))
+    }
     let p = LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0.3, 0.3])
     var two: LookupOutcome?
     var oneCalls = 0
@@ -580,7 +589,7 @@ do {
     lookup(p, id: "c1", title: "Cancel One") { _ in oneCalls += 1 }
     p.cancel(trackID: "c1")
     spin { two != nil }
-    check(two.flatMap(lyricsOf) != nil && requestCount(containing: "Cancel%20Two") == 2, "cancel: another track's pending retry still fires and completes")
+    check(two.flatMap(lyricsOf) != nil && requestCount(containing: "Cancel%20Two") == 3, "cancel: another track's pending retry still fires and completes")
     check(oneCalls == 0, "cancel: the cancelled track stays silent")
 }
 do {
@@ -602,6 +611,261 @@ do {
     let before = reqCount()
     _ = p.cachedLyrics(trackID: "k1")
     check(reqCount() == before, "cachedLyrics never touches the network")
+}
+
+// MARK: race (get and search run at the same time)
+nonisolated func isSearch(_ r: URLRequest) -> Bool { r.url!.path.hasSuffix("/search") }
+func stoppedCount(containing text: String) -> Int {
+    Stub.lock.lock(); defer { Stub.lock.unlock() }
+    return Stub.stoppedURLs.filter { $0.absoluteString.contains(text) }.count
+}
+nonisolated func searchSynced(_ lyric: String) -> Data { json([hit("River & Moon", "Paper Lanterns", 200, lyric)]) }
+nonisolated func getSynced(_ lyric: String) -> Data { json(["syncedLyrics": "[00:01.00] \(lyric)", "duration": 200]) }
+func raceLookup(_ p: LyricsProvider, id: String = "race", _ done: @escaping (LookupOutcome) -> Void) {
+    lookup(p, id: id, title: "River & Moon", done: done)
+}
+do {
+    // get keeps answering 503 (its retries are slow), search is synced: no waiting for get's retries
+    resetStub { r in isGet(r) ? (503, Data()) : (200, searchSynced("search synced")) }
+    Stub.holdMatching = ["/api/search"]
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0.5, 0.5, 0.5])
+    var outs: [LookupOutcome] = []
+    raceLookup(p) { outs.append($0) }
+    spin { requestCount(containing: "/api/get") == 1 }
+    wait(0.1)  // get's 503 is in; its retry timer waits
+    let start = Date()
+    Stub.holdMatching = []; Stub.releaseHeld()
+    spin { !outs.isEmpty }
+    check(outs.count == 1 && text(outs[0]) == "search synced", "race: get 503s, search synced: synced result")
+    check(Date().timeIntervalSince(start) < 0.3, "race: result arrives without waiting for get's retries")
+    wait(1.8)  // past every get retry delay
+    check(requestCount(containing: "/api/get") == 1, "race: get's pending retry is cancelled once search wins")
+    check(cacheFiles(dir).count == 1 && outs.count == 1, "race: synced result cached once, one completion")
+}
+do {
+    // get hangs in flight, search is synced: get's URLSessionTask is cancelled
+    resetStub { r in isGet(r) ? (200, getSynced("never delivered")) : (200, searchSynced("search wins")) }
+    Stub.holdMatching = ["/api/get"]
+    let p = LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0, 0])
+    var outs: [LookupOutcome] = []
+    raceLookup(p) { outs.append($0) }
+    spin { !outs.isEmpty }
+    check(outs.count == 1 && text(outs[0]) == "search wins", "race: search synced completes while get hangs")
+    check(requestCount(containing: "/api/get") == 1 && stoppedCount(containing: "/api/get") == 1, "race: get's in-flight request is cancelled")
+    Stub.holdMatching = []; Stub.releaseHeld()
+    wait(0.2)
+    check(outs.count == 1, "race: the cancelled get never completes again")
+}
+do {
+    // get synced quickly, search hangs: completes at once, search cancelled
+    resetStub { r in isGet(r) ? (200, getSynced("get wins")) : (200, searchSynced("search late")) }
+    Stub.holdMatching = ["/api/search"]
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0, 0])
+    var outs: [LookupOutcome] = []
+    let start = Date()
+    raceLookup(p) { outs.append($0) }
+    spin { !outs.isEmpty }
+    check(outs.count == 1 && text(outs[0]) == "get wins", "race: get synced beats a hanging search")
+    check(Date().timeIntervalSince(start) < 0.5 && requestCount(containing: "/api/search") == 1, "race: get synced completes immediately, search was fired concurrently")
+    check(stoppedCount(containing: "/api/search") == 1 && cacheFiles(dir).count == 1, "race: hanging search cancelled, result cached")
+    Stub.holdMatching = []; Stub.releaseHeld(); wait(0.2)
+    check(outs.count == 1, "race: no second completion")
+}
+do {
+    // get plain, search 503 once then synced: synced wins
+    let n = Counter()
+    resetStub { r in
+        if isGet(r) { return (200, json(plainHit(plain: "get plain one\nget plain two"))) }
+        return n.next() == 1 ? (503, Data()) : (200, searchSynced("search synced later"))
+    }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0.1, 0.1, 0.1])
+    var out: LookupOutcome?
+    raceLookup(p) { out = $0 }
+    spin { out != nil }
+    check(text(out) == "search synced later" && lyricsOf(out ?? .failed)?.isEstimated == false, "race: plain get waits for search's retry, synced wins")
+    check(requestCount(containing: "/api/search") == 2 && cacheFiles(dir).count == 1, "race: synced from the retried search cached")
+}
+do {
+    // get plain while search is still pending: wait, do not decide yet
+    resetStub { r in isGet(r) ? (200, json(plainHit(plain: "get plain one"))) : (200, searchSynced("search synced")) }
+    Stub.holdMatching = ["/api/search"]
+    let p = LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0, 0])
+    var out: LookupOutcome?
+    raceLookup(p) { out = $0 }
+    spin { requestCount(containing: "/api/get") == 1 }
+    wait(0.3)
+    check(out == nil, "race: plain get does not complete while search is pending")
+    Stub.holdMatching = []; Stub.releaseHeld()
+    spin { out != nil }
+    check(text(out) == "search synced", "race: pending search answers synced after a plain get")
+}
+do {
+    // get plain, search exhausts its retries: plain used (estimated), nothing cached
+    resetStub { r in isGet(r) ? (200, json(plainHit(plain: "get plain one\nget plain two"))) : (503, Data()) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0, 0])
+    var out: LookupOutcome?
+    raceLookup(p) { out = $0 }
+    spin { out != nil }
+    let l = lyricsOf(out ?? .failed)
+    check(l?.isEstimated == true && l?.lines.first?.text == "get plain one", "race: plain get + search exhausted: plain used, estimated")
+    check(requestCount(containing: "/api/search") == 4 && cacheFiles(dir).isEmpty, "race: partial answer is not cached (no negative either)")
+    check(p.cachedLyrics(trackID: "race") == nil, "race: nothing to peek after a partial answer")
+}
+do {
+    // get instrumental: none at once, search cancelled, definitive so cached
+    resetStub { r in isGet(r) ? (200, json(["instrumental": true])) : (200, searchSynced("x")) }
+    Stub.holdMatching = ["/api/search"]
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0, 0])
+    var out: LookupOutcome?
+    raceLookup(p) { out = $0 }
+    spin { out != nil }
+    check(isNone(out) && cacheFiles(dir).count == 1, "race: instrumental get gives none without waiting for search")
+    check(stoppedCount(containing: "/api/search") == 1, "race: search cancelled after an instrumental get")
+}
+do {
+    // both fail: nil, no cache
+    resetStub { _ in (503, Data()) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0.05, 0.05, 0.05])
+    var out: LookupOutcome?
+    let start = Date()
+    raceLookup(p) { out = $0 }
+    spin { out != nil }
+    check(out.map(outcomeName) == "failed" && cacheFiles(dir).isEmpty, "race: both endpoints failing: failed, no cache")
+    check(Date().timeIntervalSince(start) < 8, "race: both failing stays under the 8 s budget")
+    check(requestCount(containing: "/api/get") == 4 && requestCount(containing: "/api/search") == 4, "race: each endpoint tried 1 + 3 retries")
+}
+do {
+    // cancel mid-race, both requests in flight
+    resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
+    Stub.holdMatching = ["/api/get", "/api/search"]
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0, 0])
+    var calls = 0
+    raceLookup(p) { _ in calls += 1 }
+    spin { reqCount() == 2 }
+    p.cancel(trackID: "race")
+    spin { stoppedCount() == 2 }
+    check(stoppedCount(containing: "/api/get") == 1 && stoppedCount(containing: "/api/search") == 1, "race cancel: both in-flight requests cancelled")
+    Stub.holdMatching = []; Stub.releaseHeld(); wait(0.3)
+    check(calls == 0 && cacheFiles(dir).isEmpty && reqCount() == 2, "race cancel: no completion, no cache, no follow-up request")
+}
+do {
+    // cancel while both legs wait for a retry
+    resetStub { _ in (503, Data()) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0.4, 0.4, 0.4])
+    var calls = 0
+    raceLookup(p) { _ in calls += 1 }
+    spin { reqCount() == 2 }
+    wait(0.1)
+    p.cancel(trackID: "race")
+    wait(1.5)
+    check(reqCount() == 2 && calls == 0 && cacheFiles(dir).isEmpty, "race cancel: both retry timers cancelled, nothing completes or caches")
+}
+
+// MARK: jitter, budget, breaker
+do {
+    check(LYRICS_RETRY_DELAYS == [0.4, 1.2, 3] && LYRICS_RETRY_JITTER == 0.3 && LYRICS_LOOKUP_BUDGET == 8, "retry policy constants: 0.4/1.2/3 s, 30% jitter, 8 s budget")
+    for base in LYRICS_RETRY_DELAYS {
+        check(abs(LyricsProvider.jitteredDelay(base, unit: 0) - base * 0.7) < 1e-9, "jitter: unit 0 gives -30% of \(base)")
+        check(abs(LyricsProvider.jitteredDelay(base, unit: 1) - base * 1.3) < 1e-9, "jitter: unit 1 gives +30% of \(base)")
+        check(abs(LyricsProvider.jitteredDelay(base, unit: 0.5) - base) < 1e-9, "jitter: unit 0.5 gives the base \(base)")
+    }
+    let samples = (0..<2000).map { _ in LyricsProvider.jitteredDelay(1.2, unit: Double.random(in: 0...1)) }
+    check(samples.allSatisfy { $0 >= 1.2 * 0.7 - 1e-9 && $0 <= 1.2 * 1.3 + 1e-9 } && Set(samples).count > 100, "jitter: random samples stay in +-30% and vary")
+    check(LyricsProvider.jitteredDelay(1, unit: -5) == 0.7 && LyricsProvider.jitteredDelay(1, unit: 9) == 1.3, "jitter: out-of-range dice clamp to the bounds")
+    check(LyricsProvider.jitteredDelay(0, unit: 0.8) == 0, "jitter: zero base stays zero")
+}
+do {
+    // the injected dice roll is used once per scheduled retry (3 per endpoint)
+    resetStub { _ in (503, Data()) }
+    let rolls = Counter()
+    let p = LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0, 0, 0], randomUnit: { _ = rolls.next(); return 0.5 })
+    var out: LookupOutcome?
+    raceLookup(p) { out = $0 }
+    spin { out != nil }
+    check(rolls.next() == 7, "jitter: one dice roll per retry (6), injected source used")
+}
+do {
+    // the budget cuts off slow retries: failed, no cache, on time
+    resetStub { _ in (503, Data()) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [5, 5, 5], budget: 0.5, randomUnit: { 0.5 })
+    var outs: [LookupOutcome] = []
+    let start = Date()
+    raceLookup(p) { outs.append($0) }
+    spin { !outs.isEmpty }
+    let elapsed = Date().timeIntervalSince(start)
+    check(outs.count == 1 && outcomeName(outs[0]) == "failed" && elapsed >= 0.45 && elapsed < 1.2, "budget: both endpoints stuck in backoff: failed at the budget")
+    wait(0.3)
+    check(cacheFiles(dir).isEmpty && reqCount() == 2 && outs.count == 1, "budget: nothing cached, no retries after the budget, one completion")
+}
+do {
+    // budget with a plain answer from get: plain used (estimated), uncached
+    resetStub { r in isGet(r) ? (200, json(plainHit(plain: "get plain one"))) : (503, Data()) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [5, 5, 5], budget: 0.4, randomUnit: { 0.5 })
+    var out: LookupOutcome?
+    raceLookup(p) { out = $0 }
+    spin { out != nil }
+    check(lyricsOf(out ?? .failed)?.isEstimated == true && cacheFiles(dir).isEmpty, "budget: plain get kept when search never recovers, not cached")
+}
+do {
+    // breaker: more than 5 consecutive 5xx across lookups opens it; get is skipped for 60 s
+    resetStub { _ in (503, Data()) }
+    var clock = Date(timeIntervalSince1970: 2_000_000)
+    let p = LyricsProvider(cacheDirectory: tmpDir(), session: session, now: { clock }, retryDelays: [0, 0], randomUnit: { 0.5 })
+    var out: LookupOutcome?
+    raceLookup(p, id: "b1") { out = $0 }  // 6 responses of 503: opens the breaker
+    spin { out != nil }
+    check(requestCount(containing: "/api/get") == 3 && requestCount(containing: "/api/search") == 3, "breaker: first lookup tries both endpoints")
+    resetStub { r in isGet(r) ? (200, getSynced("get back")) : (200, searchSynced("search only")) }
+    out = nil
+    raceLookup(p, id: "b2") { out = $0 }
+    spin { out != nil }
+    check(requestCount(containing: "/api/get") == 0 && text(out) == "search only", "breaker open: search only, get skipped")
+    clock = clock.addingTimeInterval(LYRICS_BREAKER_OPEN_FOR - 1)
+    out = nil
+    raceLookup(p, id: "b3") { out = $0 }
+    spin { out != nil }
+    check(requestCount(containing: "/api/get") == 0, "breaker still open just before 60 s")
+    clock = clock.addingTimeInterval(2)
+    out = nil
+    raceLookup(p, id: "b4") { out = $0 }
+    spin { out != nil }
+    check(requestCount(containing: "/api/get") == 1 && text(out) == "get back", "breaker closed after 60 s: get is raced again")
+}
+do {
+    // breaker: skipped get never turns a miss into a cached negative
+    resetStub { _ in (503, Data()) }
+    let clock = Date(timeIntervalSince1970: 3_000_000)
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, now: { clock }, retryDelays: [0, 0], randomUnit: { 0.5 })
+    var out: LookupOutcome?
+    raceLookup(p, id: "m1") { out = $0 }
+    spin { out != nil }
+    resetStub { _ in (200, json([[String: Any]]())) }
+    out = nil
+    raceLookup(p, id: "m2") { out = $0 }
+    spin { out != nil }
+    check(outcomeName(out ?? .none) == "failed" && cacheFiles(dir).isEmpty && requestCount(containing: "/api/get") == 0, "breaker open: an empty search is not a definitive miss, nothing cached")
+    // 5xx streaks need to be consecutive and inside the window
+    resetStub { r in isGet(r) ? (503, Data()) : (404, Data()) }
+    let q = LyricsProvider(cacheDirectory: tmpDir(), session: session, now: { clock }, retryDelays: [0, 0], randomUnit: { 0.5 })
+    out = nil
+    raceLookup(q, id: "s1") { out = $0 }  // 3 x 503 on get, a 404 resets the streak
+    spin { out != nil }
+    resetStub { _ in (200, getSynced("x")) }
+    out = nil
+    raceLookup(q, id: "s2") { out = $0 }
+    spin { out != nil }
+    check(requestCount(containing: "/api/get") == 1, "breaker: a good reply between 5xx keeps it closed")
 }
 
 // MARK: romaji

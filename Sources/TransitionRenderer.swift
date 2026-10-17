@@ -5,13 +5,14 @@ import AVFoundation
 import MetalKit
 
 enum TransitionStyle: Int, CaseIterable {
-    case crossfade = 0, stormRewind = 1, worldLineShift = 2
+    case crossfade = 0, stormRewind = 1, worldLineShift = 2, worldLine2 = 3
 
     var displayName: String {
         switch self {
         case .crossfade: return "Crossfade"
         case .stormRewind: return "Storm rewind"
         case .worldLineShift: return "World-line shift"
+        case .worldLine2: return "Worldline 2"
         }
     }
 
@@ -20,6 +21,7 @@ enum TransitionStyle: Int, CaseIterable {
         case .crossfade: return CROSSFADE_DURATION
         case .stormRewind: return STORM_REWIND_DURATION
         case .worldLineShift: return WORLD_LINE_SHIFT_DURATION
+        case .worldLine2: return WORLD_LINE_2_DURATION
         }
     }
 
@@ -29,6 +31,7 @@ enum TransitionStyle: Int, CaseIterable {
         case .crossfade: return "Fade"
         case .stormRewind: return "Storm"
         case .worldLineShift: return "World-line"
+        case .worldLine2: return "Worldline 2"
         }
     }
 
@@ -123,6 +126,7 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    private let worldLine2Pipeline: MTLRenderPipelineState
     private let atlas: MTLTexture
     private let textureCache: CVMetalTextureCache
     private let frames: VideoFrameSource
@@ -143,14 +147,15 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
                      "TransitionUniforms must match Uniforms in Transition.metal")
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
-              let pipeline = Self.makePipeline(device: device),
+              let pipelines = Self.makePipelines(device: device),
               let atlas = DigitAtlas.makeTexture(device: device) else { return nil }
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
         guard let cache else { return nil }
         self.device = device
         self.queue = queue
-        self.pipeline = pipeline
+        self.pipeline = pipelines.normal
+        self.worldLine2Pipeline = pipelines.worldLine2
         self.atlas = atlas
         self.textureCache = cache
         self.frames = frames
@@ -172,26 +177,32 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // The user's copy in the overlay directory wins so it can be edited without a
-    // rebuild; if it is missing or broken, the copy bundled in the app takes over
-    static func makePipeline(
+    // Existing user shaders retain styles 0–2. Worldline 2 uses the bundled
+    // shader unless the user's copy explicitly declares support for style 3.
+    private static func makePipelines(
         device: MTLDevice, configShader: URL = TRANSITION_SHADER_URL,
         bundledShader: URL? = Bundle.main.url(forResource: "Transition", withExtension: "metal")
-    ) -> MTLRenderPipelineState? {
+    ) -> (normal: MTLRenderPipelineState, worldLine2: MTLRenderPipelineState)? {
+        var custom: MTLRenderPipelineState?
+        var customSupportsWorldLine2 = false
         if FileManager.default.fileExists(atPath: configShader.path) {
             do {
-                return try buildPipeline(device: device, source: configShader)
+                let source = try String(contentsOf: configShader, encoding: .utf8)
+                custom = try buildPipeline(device: device, source: source, sourceName: configShader.lastPathComponent)
+                customSupportsWorldLine2 = source.contains("// WORLDLINE2_SHADER_V1")
             } catch {
                 NSLog("wallpaper-overlay: transition shader %@ failed, using the bundled copy: %@",
                       configShader.path, "\(error)")
             }
         }
+        if customSupportsWorldLine2, let custom { return (custom, custom) }
         guard let bundledShader else {
-            NSLog("wallpaper-overlay: transition shader failed: no usable %@ and no bundled copy", configShader.path)
+            NSLog("wallpaper-overlay: transition shader failed: Worldline 2 requires a bundled shader")
             return nil
         }
         do {
-            return try buildPipeline(device: device, source: bundledShader)
+            let bundled = try buildPipeline(device: device, source: bundledShader)
+            return (custom ?? bundled, bundled)
         } catch {
             NSLog("wallpaper-overlay: transition shader failed: %@", "\(error)")
             return nil
@@ -204,6 +215,10 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
 
     private static func buildPipeline(device: MTLDevice, source url: URL) throws -> MTLRenderPipelineState {
         let source = try String(contentsOf: url, encoding: .utf8)
+        return try buildPipeline(device: device, source: source, sourceName: url.lastPathComponent)
+    }
+
+    private static func buildPipeline(device: MTLDevice, source: String, sourceName: String) throws -> MTLRenderPipelineState {
         let library = try device.makeLibrary(source: source, options: nil)
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.vertexFunction = library.makeFunction(name: "fullscreenVertex")
@@ -213,7 +228,7 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
         let state = try device.makeRenderPipelineState(descriptor: descriptor, options: [.bindingInfo], reflection: &reflection)
         // A shader whose Uniforms differ in size from the Swift struct would read garbage
         if let size = uniformsBufferSize(reflection), size != MemoryLayout<TransitionUniforms>.stride {
-            throw ShaderError(description: "Uniforms is \(size) bytes in \(url.lastPathComponent) but "
+            throw ShaderError(description: "Uniforms is \(size) bytes in \(sourceName) but "
                               + "TransitionUniforms is \(MemoryLayout<TransitionUniforms>.stride)")
         }
         return state
@@ -330,7 +345,7 @@ final class TransitionRenderer: NSObject, MTKViewDelegate {
               let drawable = view.currentDrawable,
               let commands = queue.makeCommandBuffer(),
               let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
-        encoder.setRenderPipelineState(pipeline)
+        encoder.setRenderPipelineState(frame.style == .worldLine2 ? worldLine2Pipeline : pipeline)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<TransitionUniforms>.stride, index: 0)
         encoder.setFragmentTexture(video.luma, index: 0)
         encoder.setFragmentTexture(video.chroma, index: 2)

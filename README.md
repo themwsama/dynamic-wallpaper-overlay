@@ -6,7 +6,8 @@ time-synced lyrics. It's one small native app (Swift + Metal) with no
 third-party wallpaper app needed.
 
 - **Any video as your wallpaper**, looping seamlessly, in two looks (original
-  and frosted glass) with animated transitions between them
+  and frosted glass) with animated transitions between them, including
+  Worldline 2's geometric fly-through and glitch
 - **Your name and a short description**, crisp at any resolution and anchored
   to every display's corner
 - **A gear button** opening a glass control center: clock, wallpaper look,

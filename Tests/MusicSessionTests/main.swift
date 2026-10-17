@@ -9,8 +9,25 @@ func check(_ name: String, _ ok: Bool) {
     if !ok { failures += 1 }
 }
 
-func spin(seconds: TimeInterval = 0.1) {
-    RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+// Generous ceiling for condition waits; only reached when something is really broken
+let WAIT_TIMEOUT: TimeInterval = 10
+
+// Runs the main run loop until everything already queued on the main queue has run.
+// The sentinel is FIFO behind earlier main-queue work (OperationQueue.main included).
+func drainMain() {
+    let done = Flag(false)
+    DispatchQueue.main.async { done.value = true }
+    let deadline = Date().addingTimeInterval(WAIT_TIMEOUT)
+    while !done.value && Date() < deadline {
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+    }
+}
+
+// Waits for every script already queued on the script queue to finish, then for the
+// main-queue deliveries those scripts queued. No wall-clock guess.
+func settleScripts() {
+    SPOTIFY_SCRIPT_QUEUE.sync {}
+    drainMain()
 }
 
 // Waits until everything already queued on the tap's control queue has run
@@ -176,10 +193,10 @@ final class Harness {
         session.onEnded = { [unowned self] in self.events.append("ended") }
     }
 
-    // Posts Spotify's playback notification and lets the main queue deliver it
+    // Posts Spotify's playback notification and drains the main queue so it is delivered
     func broadcast(_ state: String, _ track: SpotifyTrack?, position: Double? = nil) {
         center.post(name: SPOTIFY_NOTIFICATION, object: nil, userInfo: payload(state, track, position: position))
-        spin(seconds: 0.02)
+        drainMain()
     }
 
     // Runs the scheduled suspends that weren't cancelled, as the main queue would
@@ -192,6 +209,7 @@ final class Harness {
 // MARK: start
 let h = Harness()
 h.session.start()
+settleScripts()
 check("start listens on the notification center once", h.center.added == 1)
 check("start asks Spotify for the launch track", h.scriptRuns == 1)
 check("idle at start: suspend scheduled after the grace period",
@@ -266,7 +284,7 @@ observed.session.start()
 observed.broadcast("Playing", song("o1"))
 workspace.post(name: NSWorkspace.didTerminateApplicationNotification, object: nil,
                userInfo: [NSWorkspace.applicationUserInfoKey: NSRunningApplication.current])
-spin()
+drainMain()
 check("termination of a different app (this test binary) leaves the session alone",
       observed.session.isPlaying && observed.session.track == song("o1"))
 
@@ -287,7 +305,7 @@ func bootstrapped(running: Bool, trackFirst: Bool, output: String?, quitsDuringQ
     b.events = []
     b.tracks = []
     b.launchGate.signal()
-    spin()
+    settleScripts()
     return b
 }
 
@@ -356,7 +374,7 @@ check("tap disabled: tracks still flow", noTap.tracks.map(\.id) == [song("devtap
 let noScript = Harness(isScriptingEnabled: false)
 noScript.launchOutput = launchSnapshotOutput
 noScript.session.start()
-spin(seconds: 0.1)
+settleScripts()
 check("scripting disabled: no launch query, nothing applied", noScript.scriptRuns == 0 && noScript.tracks.isEmpty)
 noScript.broadcast("Playing", song("devscript"), position: 2)
 check("scripting disabled: notifications still sync", noScript.tracks.map(\.id) == [song("devscript").id])

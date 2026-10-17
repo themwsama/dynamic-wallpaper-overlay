@@ -6,6 +6,8 @@
 //            clockwise sweep reveal, sepia + grain, rain that falls upward
 //   style 2: world-line shift - nixie-tube digits scramble and lock, then an
 //            RGB-split / slice glitch swaps the world underneath
+//   style 3: world-line 2 - fast geometric break, perspective flight through
+//            mathematical diagrams, then a fractured reveal
 // On top of every style: the music glow along the bottom edge, with rising
 // embers, driven by Spotify's audio (GlowController.swift).
 // Compiled at runtime by TransitionRenderer.swift.
@@ -214,6 +216,209 @@ float3 worldLineShift(float2 uv, float2 vuv, texture2d<float> luma, texture2d<fl
     return col + nixieTubes(uv, u, atlas, tubes);
 }
 
+// Signed distance to a finite line segment, used for the etched drafting marks.
+float wl2Segment(float2 p, float2 a, float2 b) {
+    float2 v = b - a;
+    return length(p - a - v * clamp(dot(p - a, v) / max(dot(v, v), 1e-5), 0.0, 1.0));
+}
+
+float wl2Stroke(float distance, float width, float pixel) {
+    return 1.0 - smoothstep(width, width + pixel * 1.3, distance);
+}
+
+// A sheet carries a different construction drawing. The coordinates are in a
+// common 3D world: perspective, parallax, and sheets passing the lens therefore
+// come from camera motion instead of enlarging a flat image.
+float wl2Diagram(float2 q, int kind, float pixel) {
+    float2 p = q;
+    float r = length(p);
+    float a = atan2(p.y, p.x);
+    float ink = 0.0;
+    float thin = max(pixel * 0.8, 0.004);
+    float fine = max(pixel * 0.55, 0.0025);
+
+    // Drafting grid and crosshairs, interrupted by large circular constructs.
+    float2 grid = abs(fract(p * (kind == 1 ? 3.0 : 2.0) + 0.5) - 0.5) / (kind == 1 ? 3.0 : 2.0);
+    ink += 0.19 * wl2Stroke(min(grid.x, grid.y), fine * 0.55, pixel) * (1.0 - smoothstep(0.8, 1.8, r));
+    ink += 0.38 * wl2Stroke(min(abs(p.x), abs(p.y)), thin * 0.55, pixel) * (1.0 - smoothstep(1.6, 2.3, r));
+
+    if (kind == 0) {
+        // Concentric arcs, tangent construction, degree spokes and tick scale.
+        ink += 0.85 * wl2Stroke(abs(r - 0.72), thin, pixel);
+        ink += 0.52 * wl2Stroke(abs(r - 1.12), fine, pixel);
+        ink += 0.64 * wl2Stroke(abs(length(p - float2(0.34, -0.22)) - 0.57), fine, pixel);
+        float spoke = abs(sin(a * 12.0));
+        ink += 0.3 * wl2Stroke(spoke * r, fine * 1.3, pixel) * step(0.74, r) * (1.0 - step(1.2, r));
+        float tick = abs(sin(a * 48.0));
+        ink += 0.55 * wl2Stroke(tick * r, fine, pixel) * step(1.10, r) * (1.0 - step(1.19, r));
+        ink += 0.55 * wl2Stroke(wl2Segment(p, float2(-1.3, -0.65), float2(1.3, 0.65)), thin, pixel);
+    } else if (kind == 1) {
+        // Phase plot and three families of curves on an analytical grid.
+        float y0 = 0.36 * sin(p.x * 3.8 + 0.4);
+        float y1 = 0.63 * cos(p.x * 2.1 - 0.6);
+        float y2 = 0.17 * p.x * p.x - 0.55;
+        float inPlot = (1.0 - step(1.75, abs(p.x))) * (1.0 - step(1.15, abs(p.y)));
+        ink += inPlot * (0.95 * wl2Stroke(abs(p.y - y0), thin, pixel)
+                       + 0.66 * wl2Stroke(abs(p.y - y1), fine, pixel)
+                       + 0.58 * wl2Stroke(abs(p.y - y2), fine, pixel));
+        ink += 0.75 * wl2Stroke(abs(max(abs(p.x) - 1.78, abs(p.y) - 1.18)), thin, pixel);
+        float2 ticks = abs(fract(p * 5.0 + 0.5) - 0.5) / 5.0;
+        ink += 0.45 * wl2Stroke(ticks.x, fine, pixel) * (1.0 - step(0.055, abs(p.y))) * inPlot;
+        ink += 0.45 * wl2Stroke(ticks.y, fine, pixel) * (1.0 - step(0.055, abs(p.x))) * inPlot;
+    } else if (kind == 2) {
+        // Oblique orbital ellipses and a triangulated measurement frame.
+        float2 e = float2(p.x * 0.83 + p.y * 0.56, -p.x * 0.56 + p.y * 0.83);
+        ink += 0.85 * wl2Stroke(abs(length(e * float2(0.72, 1.43)) - 0.95), thin, pixel);
+        ink += 0.66 * wl2Stroke(abs(length(e * float2(1.31, 0.69)) - 1.13), fine, pixel);
+        ink += 0.5 * wl2Stroke(abs(r - 0.24), thin, pixel);
+        ink += 0.65 * wl2Stroke(wl2Segment(p, float2(-1.35, 0.75), float2(0.0, -1.35)), fine, pixel);
+        ink += 0.65 * wl2Stroke(wl2Segment(p, float2(0.0, -1.35), float2(1.35, 0.75)), fine, pixel);
+        ink += 0.65 * wl2Stroke(wl2Segment(p, float2(1.35, 0.75), float2(-1.35, 0.75)), fine, pixel);
+    } else {
+        // Perspective-looking polar lattice and repeating ratio marks.
+        ink += 0.80 * wl2Stroke(abs(r - 0.53), thin, pixel);
+        ink += 0.52 * wl2Stroke(abs(r - 0.97), fine, pixel);
+        ink += 0.40 * wl2Stroke(abs(r - 1.43), fine, pixel);
+        ink += 0.43 * wl2Stroke(abs(sin(a * 18.0)) * r, fine, pixel) * step(0.4, r) * (1.0 - step(1.55, r));
+        float spiral = r - (0.28 + 0.15 * (a + 3.14159));
+        ink += 0.56 * wl2Stroke(abs(spiral), fine, pixel) * step(0.0, spiral + 0.05);
+        ink += 0.75 * wl2Stroke(wl2Segment(p, float2(-1.4, -1.0), float2(1.4, 1.0)), fine, pixel);
+    }
+
+    // Calibration squares, tiny index bars and registration dots add the fine
+    // mathematical texture visible in the reference's white diagram shots.
+    float2 cell = fract((p + float2(0.17, 0.11)) * 3.2) - 0.5;
+    float2 id = floor((p + float2(0.17, 0.11)) * 3.2);
+    float selected = step(0.78, hash21(id + float2(float(kind) * 13.0, 3.7)));
+    float indexMark = min(abs(cell.y - 0.23), abs(cell.y - 0.30));
+    ink += selected * 0.28 * wl2Stroke(indexMark, fine * 0.4, pixel) * (1.0 - step(0.24, abs(cell.x)));
+    ink += selected * 0.32 * wl2Stroke(length(cell + float2(0.32, 0.18)), fine * 1.2, pixel);
+    return saturate(ink);
+}
+
+// Cells fail at different instants. Their fragments shrink towards their own
+// centers and are discarded, so neither background ever slides across screen.
+float wl2Breakup(float2 uv, float p, bool entering, float time) {
+    float2 cellPos = uv * float2(25.0, 15.0);
+    float2 id = floor(cellPos);
+    float2 local = fract(cellPos) - 0.5;
+    float rnd = hash21(id + 17.0);
+    float diagonal = 0.12 * (uv.x - uv.y);
+    float threshold = entering ? (0.015 + rnd * 0.095 + diagonal * 0.3)
+                               : (0.80 + rnd * 0.12 + diagonal * 0.25);
+    float edge = entering ? smoothstep(threshold - 0.014, threshold + 0.014, p)
+                          : smoothstep(threshold - 0.016, threshold + 0.016, p);
+    float shard = max(abs(local.x), abs(local.y));
+    float edgeNoise = hash21(id + floor(time * 28.0) * 0.27);
+    float shardMask = smoothstep(0.34, 0.49, shard + edgeNoise * 0.12);
+    return saturate(edge + shardMask * 0.11 * exp(-pow((p - threshold) / 0.025, 2.0)));
+}
+
+float3 worldLine2(float2 uv, float2 vuv, texture2d<float> luma, texture2d<float> chroma,
+                  constant Uniforms& u) {
+    float p = u.progress;
+    float aspect = u.viewSize.x / u.viewSize.y;
+    float frame = floor(u.time * 34.0);
+    float2 tile = floor(uv * float2(42.0, 25.0));
+    float entryGlitch = exp(-pow((p - 0.105) / 0.042, 2.0));
+    float exitGlitch = exp(-pow((p - 0.86) / 0.047, 2.0));
+    float midGlitch = 0.48 * exp(-pow((p - 0.39) / 0.022, 2.0))
+                    + 0.55 * exp(-pow((p - 0.64) / 0.025, 2.0));
+    float glitch = entryGlitch + exitGlitch + midGlitch;
+    float band = floor(uv.y * 38.0);
+    float bandGate = step(0.34, hash21(float2(band * 1.7, floor(u.time * 19.0))));
+    float jitter = (hash21(float2(band, frame)) - 0.5) * 0.095 * glitch * bandGate;
+    float2 sourceUV = vuv + float2(jitter, 0.0);
+    float3 from = sampleSource(luma, chroma, sourceUV, u.fromSource);
+    float3 to = sampleSource(luma, chroma, sourceUV, u.toSource);
+    if (glitch > 0.015) {
+        float split = (0.003 + 0.018 * glitch) * bandGate;
+        from.r = sampleSource(luma, chroma, sourceUV + float2(split, 0.0), u.fromSource).r;
+        from.b = sampleSource(luma, chroma, sourceUV - float2(split, 0.0), u.fromSource).b;
+        to.r = sampleSource(luma, chroma, sourceUV + float2(split, 0.0), u.toSource).r;
+        to.b = sampleSource(luma, chroma, sourceUV - float2(split, 0.0), u.toSource).b;
+    }
+
+    // Rapid breakout from the live wallpaper into a clean white drafting void.
+    float inMask = wl2Breakup(uv, p, true, u.time);
+    float outMask = wl2Breakup(uv, p, false, u.time);
+    if (p < 0.005) return from;
+    if (p > 0.99) return to;
+
+    float2 screen = (uv - 0.5) * float2(aspect, 1.0);
+    float flight = smoothstep(0.08, 0.88, p);
+    float acceleration = pow(flight, 1.55);
+    float zCamera = -0.9 + 16.4 * acceleration;
+    float bank = 0.08 * sin(flight * 7.0) + 0.34 * sin(flight * 3.5 - 0.7);
+    float2 banked = float2(screen.x * cos(bank) - screen.y * sin(bank),
+                           screen.x * sin(bank) + screen.y * cos(bank));
+    float lens = 1.49 - 0.38 * sin(flight * 3.14159) + 0.11 * flight;
+    float3 ray = normalize(float3(banked * lens
+                                  + float2(0.21 * sin(flight * 8.2), 0.13 * cos(flight * 6.4)),
+                                   1.35));
+    float2 cameraXY = float2(0.65 * sin(flight * 5.0), 0.48 * sin(flight * 7.2 + 0.7));
+
+    // Far paper stays off-white. Near planes cast pale translucent shadows and
+    // dark ink; as each plane passes the camera, the next comes into focus.
+    float3 scene = float3(0.972, 0.971, 0.955);
+    for (int layer = 7; layer >= 0; layer--) {
+        float fi = float(layer);
+        float depth = 1.2 + fi * 2.05 - zCamera;
+        if (depth < 0.11 || depth > 6.5) continue;
+        float2 world = cameraXY + ray.xy * (depth / max(ray.z, 0.12));
+        float2 center = float2(0.58 * sin(fi * 2.31), 0.43 * cos(fi * 1.73));
+        center += float2(0.18 * sin(flight * (4.0 + fi * 0.19) + fi),
+                         0.15 * cos(flight * (3.4 + fi * 0.16) - fi));
+        float spin = (layer % 2 == 0 ? 1.0 : -1.0) * (0.31 + 0.055 * fi);
+        float angle = 0.22 * sin(fi * 2.0) + 0.2 * fi + spin * flight;
+        float2 d = world - center;
+        float2 q = float2(d.x * cos(angle) - d.y * sin(angle), d.x * sin(angle) + d.y * cos(angle));
+        float edge = max(abs(q.x) / 2.55, abs(q.y) / 1.86);
+        float paper = 1.0 - smoothstep(0.94, 1.04, edge);
+        if (paper < 0.001) continue;
+        float focus = smoothstep(0.12, 0.48, depth);
+        float fadeFar = 1.0 - smoothstep(4.5, 6.5, depth);
+        float pixel = depth / max(u.viewSize.y, 500.0) * 1.45;
+        float ink = wl2Diagram(q, layer % 4, pixel);
+        float border = wl2Stroke(abs(edge - 0.95), max(pixel, 0.003), pixel);
+        float opacity = paper * focus * fadeFar * 0.86;
+        scene = mix(scene, float3(0.988, 0.984, 0.972), opacity * 0.65);
+        scene -= float3(0.29, 0.31, 0.34) * (ink * opacity + border * 0.18 * focus * fadeFar);
+    }
+
+    // A few free-standing lines produce foreground parallax and high-speed
+    // streaks while passing the lens. A little temporal flutter removes the
+    // mechanically steady look without replacing the camera's 3D motion.
+    float2 fast = screen - float2(0.12 * sin(flight * 5.0), 0.08 * cos(flight * 6.0));
+    float radius = length(fast);
+    float bearing = atan2(fast.y, fast.x);
+    float spoke = exp(-pow((fract(bearing * 23.0 + 0.07 * floor(flight * 72.0)) - 0.5) / 0.075, 2.0));
+    float dash = exp(-pow((fract(radius * 3.5 - flight * 29.0) - 0.5) / 0.21, 2.0));
+    float travelStreak = spoke * dash * smoothstep(0.13, 0.55, radius)
+                       * smoothstep(0.08, 0.35, flight) * (1.0 - smoothstep(0.80, 0.94, flight));
+    scene -= float3(0.11, 0.10, 0.13) * travelStreak * 0.38;
+    float colorTravel = smoothstep(0.09, 0.30, p) * (1.0 - smoothstep(0.72, 0.91, p));
+    float colorBand = 0.5 + 0.5 * sin(bearing * 3.0 + radius * 4.8 - flight * 11.0);
+    scene = mix(scene, scene * mix(float3(0.91, 0.96, 1.08), float3(1.08, 0.91, 1.04), colorBand),
+                0.43 * colorTravel);
+    scene += (hash21(uv * u.viewSize + frame) - 0.5) * 0.075 * glitch;
+
+    // RGB channel error and short white flashes punctuate both changes of
+    // world. A block reveal replaces the final sheet with the target wallpaper.
+    float flash = 0.26 * exp(-pow((p - 0.105) / 0.010, 2.0))
+                + 0.22 * exp(-pow((p - 0.865) / 0.012, 2.0));
+    float3 entering = mix(from, scene, inMask);
+    float3 exiting = mix(entering, to, outMask);
+    exiting += float3(flash) * glitch;
+    float errorCell = hash21(tile + frame);
+    float blackout = step(0.86, hash21(float2(band, frame * 0.31))) * bandGate;
+    exiting *= 1.0 - 0.40 * glitch * blackout;
+    exiting.r += 0.30 * glitch * (errorCell - 0.5);
+    exiting.g += 0.10 * glitch * (hash21(tile + frame + 1.8) - 0.5);
+    exiting.b -= 0.26 * glitch * (hash21(tile + frame + 3.2) - 0.5);
+    return saturate(exiting);
+}
+
 // Soft elliptical light pool; `radii` in screen-height units
 float lightPool(float2 p, float2 center, float2 radii) {
     float2 d = (p - center) / radii;
@@ -310,6 +515,9 @@ fragment float4 transitionFragment(VertexOut in [[stage_in]],
         col = stormRewind(in.uv, vuv, luma, chroma, u);
     } else if (style == 2) {
         col = worldLineShift(in.uv, vuv, luma, chroma, atlas, u);
+    // WORLDLINE2_SHADER_V1
+    } else if (style == 3) {
+        col = worldLine2(in.uv, vuv, luma, chroma, u);
     } else {
         // Idle (both sides the same half): one sample instead of two, same result
         float3 from = sampleSource(luma, chroma, vuv, u.fromSource);

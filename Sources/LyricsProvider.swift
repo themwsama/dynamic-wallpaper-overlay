@@ -17,8 +17,18 @@ let LYRICS_LAST_LINE_FALLBACK_LENGTH: TimeInterval = 5
 // started getting estimated timing, so ones cached as "none" are asked about again.
 // Older entries are ignored.
 let LYRICS_CACHE_VERSION = 4
-// Waits before the 2nd and 3rd attempt of a request that failed transiently
-let LYRICS_RETRY_DELAYS: [TimeInterval] = [1.5, 4]
+// Waits before the 2nd, 3rd and 4th attempt of an endpoint that failed transiently. Short,
+// because /api/get and /api/search are raced: a flaky endpoint must not hold a lookup back
+// when the other one can answer. Each wait is jittered by +-LYRICS_RETRY_JITTER.
+let LYRICS_RETRY_DELAYS: [TimeInterval] = [0.4, 1.2, 3]
+let LYRICS_RETRY_JITTER = 0.3
+// A lookup is decided by then with whatever it has (nothing: failed), whatever the retries say
+let LYRICS_LOOKUP_BUDGET: TimeInterval = 8
+// Circuit breaker: more than LYRICS_BREAKER_THRESHOLD consecutive 5xx within LYRICS_BREAKER_WINDOW
+// (across lookups) makes lookups skip /api/get (the flakier endpoint) for LYRICS_BREAKER_OPEN_FOR
+let LYRICS_BREAKER_THRESHOLD = 5
+let LYRICS_BREAKER_WINDOW: TimeInterval = 30
+let LYRICS_BREAKER_OPEN_FOR: TimeInterval = 60
 let LYRICS_CACHE_NAME_MAX = 80
 // Estimated timing for plain (untimed) lyrics: lines are spread over the song between
 // an intro and an outro margin, each slot weighted by the line's length
@@ -89,14 +99,14 @@ private struct LRCLibTrack: Decodable {
 // Nonisolated and Sendable: built on the URLSession queue, consumed on main
 nonisolated private enum HTTPResult: Sendable {
     case ok(Data), notFound, failed
-    case retryable  // 5xx, 429, timeouts and other transport errors
+    // 5xx, 429, timeouts and other transport errors; `isServerError` marks 5xx (the breaker's input)
+    case retryable(isServerError: Bool)
 }
 
 private enum ExactOutcome {
     case found(TimedLyrics), instrumental, failed
-    // `plainFallback` is the get result's plain text with estimated timing, used only if
-    // search finds nothing better
-    case needsSearch(plainFallback: TimedLyrics?)
+    // No synced lyrics from get; `plain` is its plain text with estimated timing
+    case noSynced(plain: TimedLyrics?)
 }
 
 // `failed` is transient (network, LRCLIB overloaded): ask again later, it's not an answer
@@ -104,12 +114,27 @@ enum LookupOutcome {
     case found(TimedLyrics), none, failed
 }
 
-// One track's lookup chain (get, search, retries). Cancelling stops the running task and the
-// retry timer; callbacks of a cancelled fetch that still arrive are dropped.
-private final class Fetch {
+// What one endpoint ended up saying. `failed` covers retries used up, an unusable reply, the
+// budget running out and a skipped endpoint: none of those is an answer, so nothing definitive
+// (a negative cache entry, a cached estimate) may be built on it.
+private enum LegResult {
+    case synced(TimedLyrics)
+    case plain(TimedLyrics)  // estimated timing
+    case instrumental
+    case empty  // a definitive "nothing acceptable"
+    case failed
+
+    var plainLyrics: TimedLyrics? { if case .plain(let lyrics) = self { return lyrics }; return nil }
+    var isFailed: Bool { if case .failed = self { return true }; return false }
+}
+
+// One endpoint's request chain (attempts and retry timer). Cancelling stops the running task and
+// the retry timer; callbacks of a cancelled leg that still arrive are dropped.
+private final class Leg {
     private(set) var isCancelled = false
     var task: URLSessionDataTask?
     var retryTimer: DispatchWorkItem?
+    var result: LegResult?  // nil while still pending
 
     func cancel() {
         isCancelled = true
@@ -120,23 +145,75 @@ private final class Fetch {
     }
 }
 
+// One track's lookup: get and search raced, plus the budget timer. Cancelling stops everything.
+private final class Fetch {
+    let get = Leg()
+    let search = Leg()
+    private(set) var isCancelled = false
+    var budgetTimer: DispatchWorkItem?
+
+    func cancel() {
+        isCancelled = true
+        get.cancel()
+        search.cancel()
+        budgetTimer?.cancel()
+        budgetTimer = nil
+    }
+}
+
+// Counts consecutive 5xx replies across lookups. Past the threshold inside the window it opens
+// for a while; any good reply resets the streak. Time comes in as an argument (testable).
+private struct ServerErrorBreaker {
+    private var streak = 0
+    private var streakStart: Date?
+    private var openUntil: Date?
+
+    func isOpen(at now: Date) -> Bool { openUntil.map { now < $0 } ?? false }
+
+    mutating func recordServerError(at now: Date) {
+        if let start = streakStart, now.timeIntervalSince(start) <= LYRICS_BREAKER_WINDOW {
+            streak += 1
+        } else {
+            streak = 1
+            streakStart = now
+        }
+        if streak > LYRICS_BREAKER_THRESHOLD {
+            openUntil = now.addingTimeInterval(LYRICS_BREAKER_OPEN_FOR)
+            streak = 0
+            streakStart = nil
+        }
+    }
+
+    mutating func recordSuccess() {
+        streak = 0
+        streakStart = nil
+    }
+}
+
 // Everything is touched on the main queue only, so no locks are needed.
 final class LyricsProvider {
     private let cacheDirectory: URL
     private let session: URLSession
     private let now: () -> Date
     private let retryDelays: [TimeInterval]
+    private let budget: TimeInterval
+    private let randomUnit: () -> Double
+    private var breaker = ServerErrorBreaker()
     private var waiters: [String: [(LookupOutcome) -> Void]] = [:]
     // The network work behind each track's waiters, so it can be cancelled by track ID
     private var fetches: [String: Fetch] = [:]
 
-    // `now` is injectable so tests can expire the negative cache
+    // `now` (negative cache expiry, breaker), `retryDelays`, `budget` and `randomUnit` (the jitter's
+    // 0...1 dice roll) are injectable so tests don't wait for real backoff
     init(cacheDirectory: URL, session: URLSession = .shared, now: @escaping () -> Date = { Date() },
-         retryDelays: [TimeInterval] = LYRICS_RETRY_DELAYS) {
+         retryDelays: [TimeInterval] = LYRICS_RETRY_DELAYS, budget: TimeInterval = LYRICS_LOOKUP_BUDGET,
+         randomUnit: @escaping () -> Double = { Double.random(in: 0...1) }) {
         self.cacheDirectory = cacheDirectory
         self.session = session
         self.now = now
         self.retryDelays = retryDelays
+        self.budget = budget
+        self.randomUnit = randomUnit
     }
 
     // MARK: Public
@@ -161,7 +238,7 @@ final class LyricsProvider {
         waiters[key] = [completion]
         let fetch = Fetch()
         fetches[key] = fetch
-        fetchExact(key: key, fetch: fetch, artist: artist, title: title, album: album, duration: duration)
+        startLookup(key: key, fetch: fetch, artist: artist, title: title, album: album, duration: duration)
     }
 
     // A usable cache entry as an outcome (found, or a still-fresh "none"), nil when the
@@ -174,8 +251,8 @@ final class LyricsProvider {
         return now().timeIntervalSince(entry.fetchedAt) < LYRICS_NEGATIVE_CACHE_TTL ? LookupOutcome.none : nil
     }
 
-    // Drops the lookup for this track: stops its in-flight URLSessionTask and pending retry
-    // timer, and forgets its waiters without calling them. Nothing is cached (a cancelled
+    // Drops the lookup for this track: stops its in-flight URLSessionTasks and pending retry and
+    // budget timers, and forgets its waiters without calling them. Nothing is cached (a cancelled
     // request is not an answer) and no other track is touched.
     func cancel(trackID: String) {
         let key = trackID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -364,60 +441,111 @@ final class LyricsProvider {
 
     // MARK: Lookup chain
 
-    private func fetchExact(key: String, fetch: Fetch, artist: String, title: String, album: String,
-                            duration: TimeInterval?) {
-        var query = [("artist_name", artist), ("track_name", title), ("album_name", album)]
-        if let duration { query.append(("duration", String(Int(duration.rounded())))) }
-        guard let url = Self.url(path: "get", query: query) else { return finish(key, .failed) }
-        request(url, label: "lyrics get", fetch: fetch) { [self] result in
-            switch result {
-            case .ok(let data):
-                switch Self.outcome(fromExact: data, duration: duration) {
-                case .found(let lyrics): finish(key, .found(lyrics))
-                case .instrumental: finish(key, .none)
-                case .needsSearch(let plainFallback):
-                    fetchSearch(key: key, fetch: fetch, artist: artist, title: title, duration: duration,
-                                plainFallback: plainFallback)
-                case .failed: finish(key, .failed)
-                }
-            case .notFound:
-                fetchSearch(key: key, fetch: fetch, artist: artist, title: title, duration: duration, plainFallback: nil)
-            case .failed, .retryable: finish(key, .failed)
+    // Fires get and search together. The first acceptable synced result wins and cancels the
+    // other request; anything less waits for the other endpoint (see `decide`). The budget timer
+    // caps the wait.
+    private func startLookup(key: String, fetch: Fetch, artist: String, title: String, album: String,
+                             duration: TimeInterval?) {
+        let timer = DispatchWorkItem { [self] in budgetExpired(key: key, fetch: fetch) }
+        fetch.budgetTimer = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + budget, execute: timer)
+
+        var getQuery = [("artist_name", artist), ("track_name", title), ("album_name", album)]
+        if let duration { getQuery.append(("duration", String(Int(duration.rounded())))) }
+        let getURL = Self.url(path: "get", query: getQuery)
+        let searchURL = Self.url(path: "search", query: [("track_name", title), ("artist_name", artist)])
+        if breaker.isOpen(at: now()) {
+            NSLog("wallpaper-overlay: lyrics get skipped (LRCLIB failing), search only")
+            fetch.get.result = .failed
+        } else if let getURL {
+            request(getURL, label: "lyrics get", leg: fetch.get) { [self] result in
+                legDone(key, fetch, fetch.get, Self.legResult(fromGet: result, duration: duration))
             }
+        } else {
+            fetch.get.result = .failed
         }
-    }
-
-    // Reached only after get gave no synced lyrics; a 200 here with nothing usable is the
-    // one definitive miss that gets a negative cache entry. Synced lyrics from search beat
-    // get's plain text; with neither, the plain text (if any) is used.
-    private func fetchSearch(key: String, fetch: Fetch, artist: String, title: String, duration: TimeInterval?,
-                             plainFallback: TimedLyrics?) {
-        guard let url = Self.url(path: "search", query: [("track_name", title), ("artist_name", artist)]) else {
-            return finish(key, .failed)
-        }
-        request(url, label: "lyrics search", fetch: fetch) { [self] result in
-            switch result {
-            case .ok(let data):
-                let found = Self.outcome(fromSearch: data, artist: artist, title: title, duration: duration)
-                finish(key, Self.preferringFallback(found, plainFallback))
-            case .notFound: finish(key, plainFallback.map { .found($0) } ?? .none)
-            case .failed, .retryable: finish(key, .failed)
+        if let searchURL {
+            request(searchURL, label: "lyrics search", leg: fetch.search) { [self] result in
+                legDone(key, fetch, fetch.search, Self.legResult(fromSearch: result, artist: artist, title: title,
+                                                                  duration: duration))
             }
+        } else {
+            fetch.search.result = .failed
+        }
+        evaluate(key: key, fetch: fetch)  // both legs may already be settled (skipped or unbuildable)
+    }
+
+    private func legDone(_ key: String, _ fetch: Fetch, _ leg: Leg, _ result: LegResult) {
+        guard !fetch.isCancelled, leg.result == nil else { return }
+        leg.result = result
+        evaluate(key: key, fetch: fetch)
+    }
+
+    private func evaluate(key: String, fetch: Fetch) {
+        guard !fetch.isCancelled,
+              let decision = Self.decide(get: fetch.get.result, search: fetch.search.result) else { return }
+        finish(key, decision.outcome, isDefinitive: decision.isDefinitive)
+    }
+
+    // Out of time: endpoints still pending count as failed, then the usual rules apply (a plain
+    // result from the other endpoint is used, otherwise the lookup failed and nothing is cached)
+    private func budgetExpired(key: String, fetch: Fetch) {
+        guard !fetch.isCancelled else { return }
+        NSLog("wallpaper-overlay: lyrics lookup budget of \(budget)s used up")
+        for leg in [fetch.get, fetch.search] where leg.result == nil {
+            leg.cancel()
+            leg.result = .failed
+        }
+        evaluate(key: key, fetch: fetch)
+    }
+
+    // The decision rules, on what the two endpoints have said so far (nil = still pending).
+    // nil result = keep waiting.
+    //  - Synced from get, or from search, ends it at once (get's exact match first if both).
+    //  - Instrumental from get ends it: none.
+    //  - Anything else (plain, nothing, failed) waits for the other endpoint.
+    //  - With both in: get's plain beats search's plain; no plain means none, or failed if an
+    //    endpoint failed. Only an answer with no failed endpoint is definitive (cacheable): a
+    //    partial one (plain while the other endpoint failed) is shown but asked about again later.
+    private static func decide(get: LegResult?, search: LegResult?) -> (outcome: LookupOutcome, isDefinitive: Bool)? {
+        if case .synced(let lyrics)? = get { return (.found(lyrics), true) }
+        if case .instrumental? = get { return (.none, true) }
+        if case .synced(let lyrics)? = search { return (.found(lyrics), true) }
+        guard let get, let search else { return nil }
+        let isDefinitive = !get.isFailed && !search.isFailed
+        if let plain = get.plainLyrics ?? search.plainLyrics { return (.found(plain), isDefinitive) }
+        return isDefinitive ? (.none, true) : (.failed, false)
+    }
+
+    private static func legResult(fromGet result: HTTPResult, duration: TimeInterval?) -> LegResult {
+        switch result {
+        case .ok(let data):
+            switch outcome(fromExact: data, duration: duration) {
+            case .found(let lyrics): return .synced(lyrics)
+            case .instrumental: return .instrumental
+            case .noSynced(let plain): return plain.map { .plain($0) } ?? .empty
+            case .failed: return .failed
+            }
+        case .notFound: return .empty
+        case .failed, .retryable: return .failed
         }
     }
 
-    // Search's estimated lyrics lose to get's (an exact-signature match); a miss falls back
-    private static func preferringFallback(_ outcome: LookupOutcome, _ fallback: TimedLyrics?) -> LookupOutcome {
-        guard let fallback else { return outcome }
-        switch outcome {
-        case .found(let lyrics) where !lyrics.isEstimated: return outcome
-        case .found, .none: return .found(fallback)
-        case .failed: return .failed
+    private static func legResult(fromSearch result: HTTPResult, artist: String, title: String,
+                                  duration: TimeInterval?) -> LegResult {
+        switch result {
+        case .ok(let data):
+            switch outcome(fromSearch: data, artist: artist, title: title, duration: duration) {
+            case .found(let lyrics): return lyrics.isEstimated ? .plain(lyrics) : .synced(lyrics)
+            case .none: return .empty
+            case .failed: return .failed
+            }
+        case .notFound: return .empty
+        case .failed, .retryable: return .failed
         }
     }
 
-    // Only instrumental: true ends the chain; plain-only or empty goes on to search,
-    // carrying the plain text along as a fallback
+    // Only instrumental: true ends the race; plain-only or empty carries what plain text there is
     private static func outcome(fromExact data: Data, duration: TimeInterval?) -> ExactOutcome {
         guard let track = try? JSONDecoder().decode(LRCLibTrack.self, from: data) else {
             NSLog("wallpaper-overlay: lyrics get response was not understood")
@@ -429,7 +557,7 @@ final class LyricsProvider {
             return .found(lyrics)
         }
         let plain = track.plainLyrics.flatMap { estimateTiming(plain: $0, duration: length) }
-        return .needsSearch(plainFallback: plain)
+        return .noSynced(plain: plain)
     }
 
     // A search hit is trusted only when it is the same song: the title must match after
@@ -512,16 +640,21 @@ final class LyricsProvider {
         }))
     }
 
-    private func finish(_ key: String, _ outcome: LookupOutcome) {
-        fetches.removeValue(forKey: key)
+    // Stops whatever is still running (the losing request, timers), then caches definitive
+    // answers only. A partial answer (`isDefinitive` false) is delivered but not remembered, and
+    // neither is a failure: network trouble is not an answer, so it retries later.
+    private func finish(_ key: String, _ outcome: LookupOutcome, isDefinitive: Bool) {
+        fetches.removeValue(forKey: key)?.cancel()
         let pending = waiters.removeValue(forKey: key) ?? []
-        switch outcome {
-        case .found(let lyrics):
-            writeCache(key, LyricsCacheEntry(version: LYRICS_CACHE_VERSION, fetchedAt: now(), lyrics: lyrics))
-        case .none:
-            writeCache(key, LyricsCacheEntry(version: LYRICS_CACHE_VERSION, fetchedAt: now(), lyrics: nil))
-        case .failed:
-            break  // Network trouble is not an answer; don't cache so it retries later
+        if isDefinitive {
+            switch outcome {
+            case .found(let lyrics):
+                writeCache(key, LyricsCacheEntry(version: LYRICS_CACHE_VERSION, fetchedAt: now(), lyrics: lyrics))
+            case .none:
+                writeCache(key, LyricsCacheEntry(version: LYRICS_CACHE_VERSION, fetchedAt: now(), lyrics: nil))
+            case .failed:
+                break
+            }
         }
         pending.forEach { $0(outcome) }
     }
@@ -543,51 +676,71 @@ final class LyricsProvider {
         return allowed
     }()
 
-    // Calls back on the main queue; logs the HTTP status, never bodies
-    // Transient failures are retried after each of retryDelays; if all fail the result
-    // is .failed. A cancelled fetch (see cancel(trackID:)) never calls back.
-    private func request(_ url: URL, label: String, fetch: Fetch, attempt: Int = 0,
+    // Seconds to wait before retry number `attempt + 1`: the base delay +-LYRICS_RETRY_JITTER.
+    // `unit` is a 0...1 dice roll (0 = shortest, 1 = longest), a parameter so tests can pin it.
+    static func jitteredDelay(_ base: TimeInterval, unit: Double) -> TimeInterval {
+        let clamped = min(1, max(0, unit))
+        return base * (1 + LYRICS_RETRY_JITTER * (2 * clamped - 1))
+    }
+
+    // Calls back on the main queue; logs the HTTP status, never bodies.
+    // Transient failures are retried after each of retryDelays (jittered); if all fail the result
+    // is .failed. A cancelled leg (see cancel(trackID:)) never calls back.
+    private func request(_ url: URL, label: String, leg: Leg, attempt: Int = 0,
                          completion: @escaping (HTTPResult) -> Void) {
-        guard !fetch.isCancelled else { return }
+        guard !leg.isCancelled else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = LYRICS_REQUEST_TIMEOUT
         request.setValue(LRCLIB_USER_AGENT, forHTTPHeaderField: "User-Agent")
         // Built here on the main actor and only ever called there; the session's
         // completion (its own queue) interprets the response and hops back with it
         let deliver: @MainActor @Sendable (HTTPResult) -> Void = { [self] result in
-            guard !fetch.isCancelled else { return }
+            guard !leg.isCancelled else { return }
+            record(result)
             guard case .retryable = result else { return completion(result) }
             guard attempt < retryDelays.count else { return completion(.failed) }
-            NSLog("wallpaper-overlay: \(label) retry \(attempt + 1) in \(retryDelays[attempt])s")
+            let delay = Self.jitteredDelay(retryDelays[attempt], unit: randomUnit())
+            NSLog("wallpaper-overlay: \(label) retry \(attempt + 1) in \(String(format: "%.2f", delay))s")
             let timer = DispatchWorkItem { [self] in
-                self.request(url, label: label, fetch: fetch, attempt: attempt + 1, completion: completion)
+                self.request(url, label: label, leg: leg, attempt: attempt + 1, completion: completion)
             }
-            fetch.retryTimer = timer
-            DispatchQueue.main.asyncAfter(deadline: .now() + retryDelays[attempt], execute: timer)
+            leg.retryTimer = timer
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: timer)
         }
         let task = session.dataTask(with: request) { data, response, error in
             let result = Self.interpret(data, response, error, label: label)
             DispatchQueue.main.async { deliver(result) }
         }
-        fetch.task = task
+        leg.task = task
         task.resume()
+    }
+
+    // Feeds the breaker: 5xx extends the streak, a good reply (200 or 404) ends it. Transport
+    // errors and other statuses say nothing about LRCLIB's health.
+    private func record(_ result: HTTPResult) {
+        switch result {
+        case .retryable(isServerError: true): breaker.recordServerError(at: now())
+        case .ok, .notFound: breaker.recordSuccess()
+        case .retryable, .failed: break
+        }
     }
 
     // Nonisolated: runs on the URLSession delegate queue
     nonisolated private static func interpret(_ data: Data?, _ response: URLResponse?, _ error: Error?,
                                               label: String) -> HTTPResult {
         if let error {
-            // Our own cancel(trackID:) lands here too; it is dropped by the cancelled fetch
+            // Our own cancel(trackID:) lands here too; it is dropped by the cancelled leg
             if (error as? URLError)?.code != .cancelled {
                 NSLog("wallpaper-overlay: \(label) request failed: \(error.localizedDescription)")
             }
-            return .retryable
+            return .retryable(isServerError: false)
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 404 { return .notFound }
         guard (200..<300).contains(status), let data else {
             NSLog("wallpaper-overlay: \(label) returned HTTP \(status)")
-            return status == 429 || (500..<600).contains(status) ? .retryable : .failed
+            if (500..<600).contains(status) { return .retryable(isServerError: true) }
+            return status == 429 ? .retryable(isServerError: false) : .failed
         }
         return .ok(data)
     }
