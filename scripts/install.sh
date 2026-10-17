@@ -90,6 +90,21 @@ json_escape() {
   printf '%s' "$out"
 }
 
+# Warn when config.json's wallpaperVideo is an absolute/~ path outside CONFIG_DIR and the file is missing.
+check_video_path() {
+  local cfg="$1" v
+  [[ -f "$cfg" ]] || return 0
+  v="$(sed -n 's/^[[:space:]]*"wallpaperVideo":[[:space:]]*"\([^"]*\)".*$/\1/p' "$cfg" | head -n 1)"
+  [[ -n "$v" ]] || return 0
+  case "$v" in
+    "~") v="$HOME" ;;
+    "~/"*) v="$HOME/${v#\~/}" ;;
+  esac
+  [[ "$v" == /* ]] || return 0
+  case "$v" in "$CONFIG_DIR"/*) return 0 ;; esac
+  [[ -e "$v" ]] || echo "warning: wallpaperVideo in $cfg points to $v, which does not exist; the app will log 'backdrop video missing'. Use a relative name (e.g. wallpaper-stacked.mp4) to resolve against $CONFIG_DIR." >&2
+}
+
 # --- requirements
 say "checking requirements"
 [[ "$(uname -s)" == "Darwin" ]] || { echo "error: macOS only" >&2; exit 1; }
@@ -130,6 +145,8 @@ else
   done < "$REPO/config.example.json"
   echo "wrote $CONFIG"
 fi
+
+check_video_path "$CONFIG"
 
 # --- wallpaper
 if [[ -n "$VIDEO" ]]; then

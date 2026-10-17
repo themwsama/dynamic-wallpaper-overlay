@@ -271,7 +271,7 @@ Edit `~/.config/wallpaper-overlay/config.json`, then restart with
   "nixieNumber": "18.151210",
   "nameFont": "Didot",
   "subtitleFont": "Baskerville-SemiBold",
-  "wallpaperVideo": "~/.config/wallpaper-overlay/wallpaper-stacked.mp4"
+  "wallpaperVideo": "wallpaper-stacked.mp4"
 }
 ```
 
