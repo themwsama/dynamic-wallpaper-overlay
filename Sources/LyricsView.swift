@@ -30,6 +30,11 @@ let LYRICS_ESTIMATED_OPACITY: Float = 0.85  // of the normal line opacity
 let LYRICS_ESTIMATED_MARKER = "♪ approximate"
 let LYRICS_ESTIMATED_MARKER_FONT = NSFont(name: "Baskerville-Italic", size: 9) ?? .systemFont(ofSize: 9)
 let LYRICS_ESTIMATED_MARKER_ALPHA: CGFloat = 0.5
+// The track name and artist shown before the first line (and while lyrics load): small, dim, no sweep
+let LYRICS_PLACEHOLDER_OPACITY: Float = 0.6  // of the normal line opacity
+let LYRICS_PLACEHOLDER_TITLE_FONT = NSFont(name: "Baskerville-SemiBold", size: 14) ?? .systemFont(ofSize: 14)
+let LYRICS_PLACEHOLDER_ARTIST_FONT = NSFont(name: "Baskerville", size: 11) ?? .systemFont(ofSize: 11)
+let LYRICS_PLACEHOLDER_TRACKING: CGFloat = 2
 let LYRICS_SWEEP_MIN_DURATION: TimeInterval = 0.5
 let LYRICS_SWEEP_TAIL: TimeInterval = 0.3  // the sweep ends this long before the line does
 let LYRICS_SWEEP_ENTRY_SHARE: Double = 0.8  // the sweep starts once this much of the entry has played
@@ -71,6 +76,7 @@ protocol LyricsDisplay: AnyObject {
     func setVisible(_ visible: Bool)
     func clear()
     func removeLine()
+    func showPlaceholder(title: String, artist: String)
     func show(text: String, romaji: String?, duration: TimeInterval, accent: NSColor, reducedMotion: Bool,
               isEstimated: Bool)
 }
@@ -108,6 +114,40 @@ final class LyricsView: NSView, LyricsDisplay {
     func removeLine() {
         root.sublayers?.forEach { $0.removeFromSuperlayer() }
         current = nil
+    }
+
+    // The track's title and artist, small and dim, with no entry animation or sweep. Shown before
+    // the first line and while lyrics load; replaced like any line by the next show(...).
+    func showPlaceholder(title: String, artist: String) {
+        retireCurrentLine()
+        let name = title.trimmingCharacters(in: .whitespaces)
+        let by = artist.trimmingCharacters(in: .whitespaces)
+        let rows = [(name, LYRICS_PLACEHOLDER_TITLE_FONT), (by, LYRICS_PLACEHOLDER_ARTIST_FONT)].filter { !$0.0.isEmpty }
+        guard !rows.isEmpty else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        let container = CALayer()
+        container.frame = bounds
+        container.shadowColor = SHADOW_COLOR.cgColor
+        container.shadowOpacity = 1
+        container.shadowRadius = 9
+        container.shadowOffset = .zero
+        container.opacity = LYRICS_PLACEHOLDER_OPACITY
+        root.addSublayer(container)
+        current = container
+        // Bottom-up like a line: the last row on the floor of the box
+        var y: CGFloat = 0
+        for (text, font) in rows.reversed() {
+            let height = ceil(font.ascender - font.descender + font.leading) + 2
+            let layer = CATextLayer()
+            layer.string = tracked(text, font: font, tracking: LYRICS_PLACEHOLDER_TRACKING, color: TEXT_COLOR)
+            layer.contentsScale = scale
+            layer.truncationMode = .end
+            layer.isWrapped = false
+            layer.frame = NSRect(x: 0, y: y, width: bounds.width, height: height)
+            container.addSublayer(layer)
+            y += height + LYRICS_LINE_GAP
+        }
+        fadeIn(container, begin: CACurrentMediaTime(), to: LYRICS_PLACEHOLDER_OPACITY)
     }
 
     // `duration` is how long the line stays up; the karaoke sweep spans most of it.

@@ -17,13 +17,17 @@ in order. Don't guess.
    track. That needs a Spotify notification, or the launch-time query.
 2. **Lyrics loaded.** `LyricsProvider` returned `.found` for that track ID.
    It must be the *current* track ID, not a stale completion.
+   A cache hit applies at once; otherwise the lookup starts only after the track
+   has stayed current for `LYRICS_FETCH_DEBOUNCE` (0.6 s), so "no lyrics yet" for
+   the first moments of a track is expected (the trace says `2-lookup-pending`).
 3. **Playing.** `isPlaying` is true and the Lyrics tile is on.
 4. **Position known.** `PlaybackClock.position()` is non-nil and moving. It's
    nil only before the first anchor; after `reset()` it is *frozen at 0* (not
    nil) until a notification position or a poll syncs it.
 5. **Inside a line.** `lineIndex(at: position + LYRICS_LEAD)` is non-nil and
-   the line text isn't empty. Instrumental gaps and the time before the first
-   timestamp are intentionally blank.
+   the line text isn't empty. Instrumental gaps are intentionally blank. The time
+   before the first sung line (the intro) and a pending lookup show the title and
+   artist placeholder instead; a song with no lyrics (`.none`) stays empty.
 6. **Drawn.** `LyricsView` is visible (root opacity), its window is ordered
    front, and the line's layers weren't removed by a late cleanup. It must be
    the view that exists *now*: a display change rebuilds every window, and the
@@ -45,6 +49,7 @@ in order. Don't guess.
 | 10 | No lyrics when the overlay started mid-song | The track was only learned from change notifications | Query Spotify once at launch |
 | 11 | Songs with only plain lyrics stayed blank | Plain text was ignored | Show it with estimated timing and mark it "approximate" |
 | 12 | Lyrics sometimes show, sometimes don't (2026-10-16): fetched for every song, but the box stayed empty for the rest of a song | Condition 6. A display change (`didChangeScreenParametersNotification`, which also fires on a 1-pixel `visibleFrame` change, e.g. the Dock or menu bar, and on external-display wake) makes `OverlayController.rebuild()` replace every `LyricsView`. The new views start at opacity 0 and empty. `LyricsController` never told them: `setVisible` only runs on a play, lyrics or setting change, and `tick()` skipped the redraw because `shownIndex` still matched the line drawn on the *old* view. Recovery only came with the next pause, toggle or song with lyrics. The live log showed about 9 rebuilds in 20 minutes on the user's two-display setup | State the controller remembers about a view is only valid for that view instance. `tick()` now notices replaced views (by identity), fades them in and redraws the line. `Tests/LyricsControllerTests` replays real event sequences through the real controller and clock and asserts "playing inside a line ⇒ line shown within one tick" |
+| 13 | Lyrics slow or late after skipping songs fast (2026-10-16): lyrics for the song landed on arrived up to 6.9 s late. Also, right after a change the box was empty for the intro and looked broken | Cause 1: every track change fired an LRCLIB request at once, even for tracks skipped within 0.3 s (about 10 requests in 10 s). LRCLIB answered the burst with HTTP 503, and the song the user landed on then sat through the provider's retries (1.5 s, then 4 s). Nothing was cancelled, so requests and retry timers for skipped songs kept running and kept the burst going. Cause 2: not a bug. Condition 5 is correct before the first timestamp (`5-between-lines` in the trace), but an empty box for a few seconds after a change looks the same as "lyrics are broken" | Don't turn every UI event into a network request: wait until the track has stayed current for `LYRICS_FETCH_DEBOUNCE` (0.6 s), but apply a cache hit at once (`cachedLyrics(trackID:)`, no network). Cancel work for superseded targets, keyed by ID: `LyricsProvider.cancel(trackID:)` stops the `URLSessionTask` and the retry timer, drops that track's waiters silently, never writes a negative cache entry and never touches another track; the controller cancels its debounce and retry timers too. "Correct but looks broken" is a bug for the user: the box shows the title and artist (small, 60% alpha, no sweep) while a lookup is pending and in the song's intro (start of the song only, never in mid-song gaps, never for `.none`). `Tests/LyricsControllerTests` replays "8 skips 0.3 s apart, the 9th stays" and asserts one lookup, for the 9th track |
 
 ## Process mistakes
 

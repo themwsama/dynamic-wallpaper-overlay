@@ -51,5 +51,31 @@ check("estimated opacity is 0.85 of normal", LYRICS_ESTIMATED_OPACITY == 0.85)
 check("estimated marker constant", LYRICS_ESTIMATED_MARKER.contains("approximate") && LYRICS_ESTIMATED_MARKER_ALPHA == 0.5)
 check("constants", LYRICS_SWEEP_TAIL == 0.3 && LYRICS_SWEEP_MIN_DURATION == 0.5)
 
+// Placeholder: the track name and artist, dim, no sweep, replaced by the first real line
+let view = LyricsView(frame: NSRect(origin: .zero, size: LYRICS_BOX))
+func containers() -> [CALayer] { view.layer?.sublayers ?? [] }
+func allLayers(_ layer: CALayer) -> [CALayer] { [layer] + (layer.sublayers ?? []).flatMap(allLayers) }
+view.showPlaceholder(title: "Invented Title", artist: "Invented Artist")
+check("placeholder adds one container", containers().count == 1)
+check("placeholder is dim: 60% of the box opacity", containers().first?.opacity == LYRICS_PLACEHOLDER_OPACITY && LYRICS_PLACEHOLDER_OPACITY == 0.6)
+let textLayers = containers().first.map(allLayers)?.compactMap { $0 as? CATextLayer } ?? []
+func rowY(_ text: String) -> CGFloat? { textLayers.first { ($0.string as? NSAttributedString)?.string == text }?.frame.minY }
+check("placeholder draws the title and the artist", textLayers.count == 2 && rowY("Invented Title") != nil && rowY("Invented Artist") != nil)
+check("placeholder puts the title above the artist (y points up)", (rowY("Invented Title") ?? 0) > (rowY("Invented Artist") ?? 1))
+check("placeholder has no karaoke sweep", containers().first.map(allLayers)?.contains { $0.mask != nil } == false)
+check("placeholder has no per-character entry animation", containers().first.map(allLayers)?.contains { $0.animation(forKey: "entry") != nil } == false)
+check("placeholder fades in like a line", containers().first?.animation(forKey: "fadeIn") != nil)
+view.showPlaceholder(title: "Invented Title", artist: "Invented Artist")
+check("placeholder again retires the previous one", containers().count == 2 && containers().first?.animation(forKey: "exit") != nil)
+view.show(text: "Invented first line", romaji: nil, duration: 4, accent: .white, reducedMotion: false)
+check("a real line retires the placeholder with the normal exit", containers().count == 3 && containers()[1].animation(forKey: "exit") != nil)
+check("the real line has the sweep", containers().last.map(allLayers)?.contains { $0.mask != nil } == true && containers().last?.opacity == 1)
+view.removeLine()
+check("removeLine frees the placeholder too", containers().isEmpty)
+view.showPlaceholder(title: "", artist: "")
+check("an empty title and artist draws nothing", containers().isEmpty)
+view.showPlaceholder(title: "A title that is far too long to fit in a three hundred sixty point wide box at fourteen points", artist: "Invented Artist")
+check("a long title is truncated, not wrapped", containers().first.map(allLayers)?.compactMap { $0 as? CATextLayer }.allSatisfy { $0.truncationMode == .end && !$0.isWrapped } == true)
+
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

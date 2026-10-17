@@ -11,11 +11,24 @@ func check(_ cond: Bool, _ name: String) {
 nonisolated final class Stub: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data)?)?  // nil = network error
     nonisolated(unsafe) static var requests: [URLRequest] = []
+    // Requests whose URL contains one of these are accepted but never answered until `releaseHeld`
+    nonisolated(unsafe) static var holdMatching: [String] = []
+    nonisolated(unsafe) static var held: [Stub] = []
+    nonisolated(unsafe) static var stoppedURLs: [URL] = []
     static let lock = NSLock()
+    static func isHeld(_ request: URLRequest) -> Bool {
+        let url = request.url!.absoluteString
+        return holdMatching.contains { url.contains($0) }
+    }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        Stub.lock.lock(); Stub.requests.append(request); Stub.lock.unlock()
+        Stub.lock.lock(); Stub.requests.append(request)
+        if Stub.isHeld(request) { Stub.held.append(self); Stub.lock.unlock(); return }
+        Stub.lock.unlock()
+        respond()
+    }
+    func respond() {
         guard let (status, body) = Stub.handler?(request) else {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)); return
         }
@@ -24,7 +37,14 @@ nonisolated final class Stub: URLProtocol, @unchecked Sendable {
         client?.urlProtocol(self, didLoad: body)
         client?.urlProtocolDidFinishLoading(self)
     }
-    override func stopLoading() {}
+    override func stopLoading() {
+        Stub.lock.lock(); Stub.stoppedURLs.append(request.url!); Stub.held.removeAll { $0 === self }; Stub.lock.unlock()
+    }
+    // Answers every held request (a cancelled one has already left the list)
+    static func releaseHeld() {
+        lock.lock(); let ready = held; held = []; lock.unlock()
+        ready.forEach { $0.respond() }
+    }
 }
 // Request counter for stub handlers, which run on URLSession's threads
 nonisolated final class Counter: @unchecked Sendable {
@@ -32,7 +52,16 @@ nonisolated final class Counter: @unchecked Sendable {
     private var value = 0
     func next() -> Int { lock.lock(); defer { lock.unlock() }; value += 1; return value }
 }
-func resetStub(_ h: @escaping @Sendable (URLRequest) -> (Int, Data)?) { Stub.lock.lock(); Stub.requests = []; Stub.lock.unlock(); Stub.handler = h }
+func resetStub(_ h: @escaping @Sendable (URLRequest) -> (Int, Data)?) {
+    Stub.lock.lock(); Stub.requests = []; Stub.holdMatching = []; Stub.held = []; Stub.stoppedURLs = []; Stub.lock.unlock()
+    Stub.handler = h
+}
+func stoppedCount() -> Int { Stub.lock.lock(); defer { Stub.lock.unlock() }; return Stub.stoppedURLs.count }
+func requestCount(containing text: String) -> Int {
+    Stub.lock.lock(); defer { Stub.lock.unlock() }
+    return Stub.requests.filter { $0.url!.absoluteString.contains(text) }.count
+}
+func wait(_ seconds: TimeInterval) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
 func reqCount() -> Int { Stub.lock.lock(); defer { Stub.lock.unlock() }; return Stub.requests.count }
 let cfg = URLSessionConfiguration.ephemeral
 cfg.protocolClasses = [Stub.self]
@@ -470,6 +499,109 @@ do {
     resetStub { _ in (500, Data()) }
     let l = fetch(LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0]))
     check(l?.lines.first?.text == "cached invented" && l?.isEstimated == false && reqCount() == 0, "cache entry without isEstimated decodes as exact")
+}
+
+
+// MARK: cancellation and cache peek
+// Tracks are told apart by title: "Cancel One" is held in flight, "Cancel Two" is a bystander
+func lookup(_ p: LyricsProvider, id: String, title: String, done: @escaping (LookupOutcome) -> Void) {
+    p.lyrics(trackID: id, artist: "Paper Lanterns", title: title, album: "Night", duration: 200, completion: done)
+}
+func outcomeName(_ o: LookupOutcome) -> String {
+    switch o { case .found: return "found"; case .none: return "none"; case .failed: return "failed" }
+}
+do {
+    // cancel while the request is in flight: no completion, no cache, the task is stopped
+    resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
+    Stub.holdMatching = ["Cancel%20One"]
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])
+    var calls: [String] = []
+    lookup(p, id: "c1", title: "Cancel One") { calls.append("c1 \(outcomeName($0))") }
+    spin { requestCount(containing: "Cancel%20One") == 1 }
+    p.cancel(trackID: "c1")
+    spin { stoppedCount() == 1 }
+    check(stoppedCount() == 1, "cancel: the in-flight URLSessionTask is cancelled")
+    Stub.releaseHeld()
+    wait(0.3)
+    check(calls.isEmpty, "cancel in flight: no completion side effects")
+    check(cacheFiles(dir).isEmpty && p.cachedLyrics(trackID: "c1") == nil, "cancel in flight: no negative cache entry")
+    check(reqCount() == 1, "cancel in flight: no retry or follow-up request")
+}
+do {
+    // other tracks' waiters are unaffected by a cancel, and a cancelled id can be asked again
+    resetStub { _ in (200, json(["syncedLyrics": lrcA])) }
+    Stub.holdMatching = ["Cancel%20One", "Cancel%20Two"]
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0, 0])
+    var calls: [String] = []
+    lookup(p, id: "c1", title: "Cancel One") { calls.append("c1 \(outcomeName($0))") }
+    lookup(p, id: "c2", title: "Cancel Two") { calls.append("c2 \(outcomeName($0))") }
+    lookup(p, id: "c2", title: "Cancel Two") { calls.append("c2b \(outcomeName($0))") }  // a second waiter, same id
+    spin { requestCount(containing: "Cancel%20One") == 1 && requestCount(containing: "Cancel%20Two") == 1 }
+    p.cancel(trackID: "c1")
+    Stub.holdMatching = []
+    Stub.releaseHeld()
+    spin { calls.count == 2 }
+    check(calls.sorted() == ["c2 found", "c2b found"], "cancel: other track's waiters still complete, the cancelled one doesn't")
+    check(cacheFiles(dir).count == 1 && p.cachedLyrics(trackID: "c2") != nil, "cancel: only the other track was cached")
+    check(requestCount(containing: "Cancel%20Two") == 1, "cancel: other track's request not repeated")
+    // asking about the cancelled id again starts fresh and completes normally
+    var again: LookupOutcome?
+    lookup(p, id: "c1", title: "Cancel One") { again = $0 }
+    spin { again != nil }
+    check(again.flatMap(lyricsOf) != nil && !calls.contains { $0.hasPrefix("c1") }, "cancel: the same id can be looked up again, the old completion stays silent")
+    p.cancel(trackID: "never-asked")
+    p.cancel(trackID: "c1")  // already finished: nothing to cancel
+    check(true, "cancel: unknown and finished ids are no-ops")
+}
+do {
+    // cancel during a retry wait: the timer never fires, nothing is cached, nothing completes
+    resetStub { _ in (503, Data()) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, retryDelays: [0.4, 0.4])
+    var calls = 0
+    lookup(p, id: "c1", title: "Cancel One") { _ in calls += 1 }
+    spin { reqCount() == 1 }
+    wait(0.1)  // the 503 is in; the retry timer waits
+    p.cancel(trackID: "c1")
+    wait(1.2)  // well past both retry delays
+    check(reqCount() == 1, "cancel during a retry wait: the retry never fires")
+    check(calls == 0, "cancel during a retry wait: no completion")
+    check(cacheFiles(dir).isEmpty, "cancel during a retry wait: no negative cache entry")
+}
+do {
+    // a retry timer for one track keeps running while another track is cancelled
+    resetStub { r in r.url!.absoluteString.contains("Cancel%20Two") && Stub.requests.filter({ $0.url!.absoluteString.contains("Cancel%20Two") }).count == 1 ? (503, Data()) : (200, json(["syncedLyrics": lrcA])) }
+    let p = LyricsProvider(cacheDirectory: tmpDir(), session: session, retryDelays: [0.3, 0.3])
+    var two: LookupOutcome?
+    var oneCalls = 0
+    lookup(p, id: "c2", title: "Cancel Two") { two = $0 }
+    lookup(p, id: "c1", title: "Cancel One") { _ in oneCalls += 1 }
+    p.cancel(trackID: "c1")
+    spin { two != nil }
+    check(two.flatMap(lyricsOf) != nil && requestCount(containing: "Cancel%20Two") == 2, "cancel: another track's pending retry still fires and completes")
+    check(oneCalls == 0, "cancel: the cancelled track stays silent")
+}
+do {
+    // cachedLyrics: hit, negative hit, expired negative, miss, old version
+    var clock = Date()
+    resetStub { r in isGet(r) ? (200, json(["syncedLyrics": lrcA])) : (200, json([])) }
+    let dir = tmpDir()
+    let p = LyricsProvider(cacheDirectory: dir, session: session, now: { clock }, retryDelays: [0, 0])
+    check(p.cachedLyrics(trackID: "k1") == nil, "cachedLyrics: miss is nil")
+    _ = fetch(p, id: "k1")
+    check(p.cachedLyrics(trackID: "k1").flatMap(lyricsOf)?.lines.count == 2, "cachedLyrics: found entry")
+    check(p.cachedLyrics(trackID: "  k1 \n").flatMap(lyricsOf) != nil, "cachedLyrics: id trimmed like lookups")
+    resetStub { r in isGet(r) ? (404, Data()) : (200, json([])) }
+    _ = fetch(p, id: "k2")
+    if case .some(.none) = p.cachedLyrics(trackID: "k2") { check(true, "cachedLyrics: negative entry is a none") } else { check(false, "cachedLyrics: negative entry is a none") }
+    clock = clock.addingTimeInterval(LYRICS_NEGATIVE_CACHE_TTL + 1)
+    check(p.cachedLyrics(trackID: "k2") == nil, "cachedLyrics: expired negative is a miss")
+    if case .some(.none) = p.cachedLyrics(trackID: "") { check(true, "cachedLyrics: empty id is a none") } else { check(false, "cachedLyrics: empty id is a none") }
+    let before = reqCount()
+    _ = p.cachedLyrics(trackID: "k1")
+    check(reqCount() == before, "cachedLyrics never touches the network")
 }
 
 // MARK: romaji

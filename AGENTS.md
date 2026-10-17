@@ -146,7 +146,7 @@ All of these sit **behind** normal app windows, like a real wallpaper:
 | **Gear + control center** | A glass gear at the end of the subtitle row opens an iOS-style tile grid: Clock, Glass/Original, transition style, Glow, Lyrics, Romaji, and a Low power indicator. Clicking outside closes it. |
 | **Clock card** | Glass stopwatch / countdown timer under the name; it slides out of the way when the control center opens |
 | **Music glow** | While Spotify plays: a soft glow along the bottom edge that pulses with the real beat, colored by the song's genre, with fire sparks launched on the beat at the song's tempo |
-| **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese. Songs LRCLIB has only as plain text show with estimated timing: no sweep, slightly dimmer, marked "♪ approximate" |
+| **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese. Songs LRCLIB has only as plain text show with estimated timing: no sweep, slightly dimmer, marked "♪ approximate". While lyrics load and during a song's intro the box shows the title and artist, small and dim; songs with no lyrics keep it empty |
 | **Efficiency** | ~200 MB memory while visible; pauses and releases all video memory when the screen sleeps or locks, or the desktop is fully covered. Each screen pauses on its own when covered. Idle rendering is capped at about 1.25× the video resolution; 30 fps cap in Low Power Mode |
 
 ---
@@ -192,10 +192,10 @@ audio permission again after rebuilding. Re-allow it in System Settings.
 | `MusicSession.swift` | Owns `SpotifyWatcher` and `SpotifyAudioTap`, the 15 s pause grace period, the launch bootstrap and the Spotify-quit observer; `main.swift` wires it to genre, lyrics and glow |
 | `AudioAnalyzer.swift` | Real-time-safe loudness, bass, beat onsets, tempo (median beat gap, folded into 60–180 BPM) |
 | `GenreResolver.swift` | Track → genre bucket: cache, then iTunes Search (free, no key), then Spotify Web API (optional keys), then Gemini (optional key) |
-| `LyricsProvider.swift` | LRCLIB client (`/api/get`, falling back to `/api/search`; plain-only lyrics get estimated timing), LRC parser, retries, on-disk cache, offline romaji via `CFStringTokenizer` |
+| `LyricsProvider.swift` | LRCLIB client (`/api/get`, falling back to `/api/search`; plain-only lyrics get estimated timing), LRC parser, retries, on-disk cache (`cachedLyrics(trackID:)` peeks without the network), per-track `cancel(trackID:)` of the in-flight request and retry timer (never caches, never completes anyone), offline romaji via `CFStringTokenizer` |
 | `PlaybackClock.swift` | Interpolated playback position; polls Spotify every 2 s while playing. Bundle ID and position source are injected, with no globals |
-| `LyricsController.swift` | Picks the current line, drives `LyricsView` |
-| `LyricsView.swift` | Core Animation kinetic text: per-character rise/blur-in, karaoke sweep, two-row wrap |
+| `LyricsController.swift` | Picks the current line, drives `LyricsView`. Waits `LYRICS_FETCH_DEBOUNCE` (0.6 s) before a network lookup, applies cache hits at once, cancels a skipped track's network work, and shows the track title and artist while a lookup is pending and in the intro before the first line |
+| `LyricsView.swift` | Core Animation kinetic text: per-character rise/blur-in, karaoke sweep, two-row wrap; `showPlaceholder(title:artist:)` for the dim title/artist box |
 | `VisibilityMonitor.swift` | Sleep/lock/session/occlusion detection → pause rendering and free frames |
 | `Housekeeping.swift` | Prunes the lyrics cache (60 days / 400 files) and trims the log in place (2 MB → 500 KB) every 6 h |
 | `scripts/lib.sh` | Shared script helpers: env overrides, `DRY_RUN` parsing, `BUNDLE_ID` validation, default paths |
@@ -394,7 +394,7 @@ using invented text.
   `@Sendable`, or it traps at runtime.
 - Dev switches: `WALLPAPER_OVERLAY_NO_AUDIO_TAP=1` and
   `WALLPAPER_OVERLAY_NO_APPLESCRIPT=1` let you test-launch without permission
-  prompts. `WALLPAPER_OVERLAY_TRACE_LYRICS=1` logs lyric display decisions.
+  prompts. `WALLPAPER_OVERLAY_TRACE_LYRICS=1` logs lyric display decisions (including `debounced`, `cancelled` and `placeholder`; titles and artists, never lyric text).
 - Audio-thread code (`AudioAnalyzer.process`) must not allocate or lock.
 - `Uniforms` in `Transition.metal` and `TransitionUniforms` in Swift must match
   field for field (16-byte aligned `float4`s; stride 160). The app checks the

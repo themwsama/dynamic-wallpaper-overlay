@@ -29,13 +29,20 @@ let AFTER_FADE = LYRICS_FADE_DURATION + 0.2
 final class FakeView: LyricsDisplay {
     private(set) var isVisible = false  // a new LyricsView starts at opacity 0
     private(set) var text: String?
+    // "title|artist" while the track-name placeholder is up
+    private(set) var placeholder: String?
     func setVisible(_ visible: Bool) { isVisible = visible }
-    func clear() { text = nil }
-    func removeLine() { text = nil }
+    func clear() { text = nil; placeholder = nil }
+    func removeLine() { text = nil; placeholder = nil }
+    func showPlaceholder(title: String, artist: String) {
+        text = nil
+        placeholder = "\(title)|\(artist)"
+    }
     func show(text: String, romaji: String?, duration: TimeInterval, accent: NSColor, reducedMotion: Bool,
               isEstimated: Bool) {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         self.text = trimmed.isEmpty ? nil : trimmed
+        placeholder = nil
     }
 }
 
@@ -71,16 +78,38 @@ final class FakeSpotify: SpotifyPositionSource, @unchecked Sendable {
     var lastErrorNumber: Int? { locked { pollError } }
 }
 
-// Answers from a table; a held track's answer waits until `release`
+// Answers from a table; a held track's answer waits until `release`. With `usesCache` the table
+// doubles as the provider's disk cache (every unheld track is a hit, a track without an answer a
+// cached "none"); tests of the network path turn it off. `failures[id]` makes the first N network
+// requests for that track fail transiently.
 final class FakeLookup: LyricsLookup {
     var answers: [String: TimedLyrics] = [:]
     var held: Set<String> = []
+    var usesCache = true
+    var failures: [String: Int] = [:]
+    // A real provider never completes a cancelled request; flip to model one that answers late
+    var honorsCancel = true
     private var pending: [(String, (LookupOutcome) -> Void)] = []
     private(set) var requests: [String] = []
+    private(set) var cancelled: [String] = []
+
+    func cachedLyrics(trackID: String) -> LookupOutcome? {
+        guard usesCache, !held.contains(trackID) else { return nil }
+        return answers[trackID].map(LookupOutcome.found) ?? LookupOutcome.none
+    }
+
+    func cancel(trackID: String) {
+        cancelled.append(trackID)
+        if honorsCancel { pending.removeAll { $0.0 == trackID } }
+    }
 
     func lyrics(trackID: String, artist: String, title: String, album: String, duration: TimeInterval?,
                 completion: @escaping (LookupOutcome) -> Void) {
         requests.append(trackID)
+        if let left = failures[trackID], left > 0 {
+            failures[trackID] = left - 1
+            return completion(.failed)
+        }
         if held.contains(trackID) { return pending.append((trackID, completion)) }
         completion(answers[trackID].map(LookupOutcome.found) ?? .none)
     }
@@ -109,6 +138,9 @@ func syncedLyrics(_ tag: String) -> TimedLyrics {
     return TimedLyrics(lines: lines)
 }
 
+// Short enough to wait out in a test; the real ones are 5 s and up
+let TEST_RETRY_DELAYS: [TimeInterval] = [0.8, 1.0]
+
 // MARK: Harness, wired the way OverlayController wires the real thing
 
 final class Harness {
@@ -134,7 +166,7 @@ final class Harness {
             isAppRunning: { _ in false }, workspaceCenter: NotificationCenter())
         controller = LyricsController(
             settings: settings, provider: lookup, clock: clock, views: { [unowned self] in self.views },
-            accent: { .white }, trace: { [unowned self] in self.traces.append($0) })
+            accent: { .white }, trace: { [unowned self] in self.traces.append($0) }, retryDelays: TEST_RETRY_DELAYS)
         session.onTrack = { [unowned self] track in self.controller.trackChanged(track, position: self.session.lastPosition) }
         session.onPlayState = { [unowned self] playing in self.controller.playStateChanged(playing) }
         session.onPosition = { [unowned self] seconds in self.controller.positionChanged(seconds) }
@@ -405,6 +437,203 @@ scenario("trace names the failing condition, without lyric text") { h in
     let before = h.traces.count
     spin(0.5)
     check("trace is quiet while nothing changes", h.traces.count == before)
+}
+
+
+// MARK: Debounce, cancellation, placeholder
+
+// Polls the run loop until the condition holds; false on timeout
+func waitUntil(_ timeout: TimeInterval = 3, _ condition: () -> Bool) -> Bool {
+    let end = Date().addingTimeInterval(timeout)
+    while !condition() && Date() < end { spin(0.01) }
+    return condition()
+}
+
+func spamSong(_ n: Int) -> SpotifyTrack { song("spam\(n)") }
+let PLACEHOLDER_SLACK = 0.15  // scheduling jitter allowed on top of the stated bounds
+
+scenario("skip spam: 8 quick skips, the 9th stays") { h in
+    h.lookup.usesCache = false
+    for n in 1...9 { h.lookup.answers[spamSong(n).id] = syncedLyrics("S\(n)") }
+    h.lookup.held = [spamSong(9).id]
+    for n in 1...8 {
+        h.play(spamSong(n), at: 0)
+        h.spotify.advance(0.3)
+        spin(0.3)
+    }
+    check("skip spam: no lookup while skipping", h.lookup.requests.isEmpty, "\(h.lookup.requests)")
+    check("skip spam: no lookup was cancelled that never started", h.lookup.cancelled.isEmpty, "\(h.lookup.cancelled)")
+    let landed = Date()
+    h.play(spamSong(9), at: 0)
+    spin(ONE_TICK)
+    check("skip spam: placeholder shows while the lookup waits",
+          h.views.allSatisfy { $0.isVisible && $0.placeholder == "Song spam9|Lantern Choir" }, h.describeViews())
+    spin(LYRICS_FETCH_DEBOUNCE / 2)
+    check("skip spam: still nothing mid-debounce", h.lookup.requests.isEmpty, "\(h.lookup.requests)")
+    check("skip spam: lookup starts after the debounce", waitUntil { h.lookup.requests.count == 1 })
+    check("skip spam: that lookup is for the 9th track only", h.lookup.requests == [spamSong(9).id], "\(h.lookup.requests)")
+    check("skip spam: waited at least the debounce", Date().timeIntervalSince(landed) >= LYRICS_FETCH_DEBOUNCE - 0.05)
+    check("skip spam: placeholder stays while the lookup is in flight",
+          h.views.allSatisfy { $0.placeholder == "Song spam9|Lantern Choir" }, h.describeViews())
+    // The network answers 0.2 s later; the song is already past its first line
+    let fetchTime = 0.2
+    spin(fetchTime)
+    h.lookup.release(spamSong(9).id)
+    h.spotify.advance(4.0)
+    let shown = waitUntil { h.views.allSatisfy { $0.text == "S9 line 1" } }
+    let elapsed = Date().timeIntervalSince(landed)
+    check("skip spam: first line shows", shown, h.describeViews())
+    check("skip spam: first line within debounce + fetch + 1 tick",
+          elapsed <= LYRICS_FETCH_DEBOUNCE + fetchTime + ONE_TICK + PLACEHOLDER_SLACK + 0.1, String(format: "%.2f s", elapsed))
+    check("skip spam: no stray lookup afterwards", h.lookup.requests == [spamSong(9).id], "\(h.lookup.requests)")
+    check("skip spam: trace has debounced", h.traces.contains { $0.contains("debounced") })
+    check("skip spam: trace has cancelled", h.traces.contains { $0.contains("cancelled") })
+    check("skip spam: trace has placeholder", h.traces.contains { $0.contains("placeholder") })
+    check("skip spam: trace names titles, never lyric text",
+          h.traces.contains { $0.contains("Song spam9") } && !h.traces.contains { $0.contains(" line ") || $0.contains("verse") })
+}
+
+scenario("cache hit applies at once, without the debounce") { h in
+    h.lookup.answers[songA.id] = syncedLyrics("A")
+    h.play(songA, at: 5)
+    spin(ONE_TICK)
+    check("cache hit: line shown within a tick", h.views.allSatisfy { $0.isVisible && $0.text == "A line 1" }, h.describeViews())
+    check("cache hit: nothing waited on", LYRICS_FETCH_DEBOUNCE > ONE_TICK * 2)
+    check("cache hit: no network lookup", h.lookup.requests.isEmpty, "\(h.lookup.requests)")
+    spin(LYRICS_FETCH_DEBOUNCE + 0.1)
+    check("cache hit: still no network lookup after the debounce", h.lookup.requests.isEmpty, "\(h.lookup.requests)")
+    check("cache hit: no placeholder anywhere", !h.traces.contains { $0.contains("placeholder") }, "\(h.traces)")
+}
+
+scenario("cached 'none' needs no lookup and no placeholder") { h in
+    h.play(songB, at: 0)  // no answer: cached none
+    spin(LYRICS_FETCH_DEBOUNCE + 0.2)
+    check("cached none: no network lookup", h.lookup.requests.isEmpty, "\(h.lookup.requests)")
+    check("cached none: box empty, no placeholder", h.views.allSatisfy { $0.text == nil && $0.placeholder == nil }, h.describeViews())
+}
+
+scenario("retry in flight when a newer track arrives") { h in
+    h.lookup.usesCache = false
+    h.lookup.answers[songA.id] = syncedLyrics("A")
+    h.lookup.answers[songB.id] = syncedLyrics("B")
+    h.lookup.failures[songA.id] = 1
+    h.play(songA, at: 0)
+    check("retry: A looked up once after the debounce", waitUntil { h.lookup.requests == [songA.id] }, "\(h.lookup.requests)")
+    spin(0.1)  // A failed; its retry timer is now waiting
+    check("retry: placeholder stays while the retry waits", h.views.allSatisfy { $0.placeholder == "Song aaaa|Lantern Choir" }, h.describeViews())
+    h.play(songB, at: 0)
+    spin(TEST_RETRY_DELAYS[0] + 0.4)  // past the moment A's retry would have fired
+    check("retry: A's retry never fires", !h.lookup.requests.dropFirst().contains(songA.id), "\(h.lookup.requests)")
+    check("retry: B looked up after its own debounce", waitUntil { h.lookup.requests.contains(songB.id) }, "\(h.lookup.requests)")
+    h.spotify.advance(4.2)
+    check("retry: only B's line is ever shown", waitUntil { h.views.allSatisfy { $0.text == "B line 1" } }, h.describeViews())
+    check("retry: exactly A once and B once", h.lookup.requests == [songA.id, songB.id], "\(h.lookup.requests)")
+}
+
+scenario("request in flight when a newer track arrives") { h in
+    h.lookup.usesCache = false
+    h.lookup.honorsCancel = false  // even a provider that answers late must not leak into the new track
+    h.lookup.answers[songA.id] = syncedLyrics("A")
+    h.lookup.answers[songB.id] = syncedLyrics("B")
+    h.lookup.held = [songA.id]
+    h.play(songA, at: 0)
+    check("in flight: A's request is out", waitUntil { h.lookup.requests == [songA.id] }, "\(h.lookup.requests)")
+    h.play(songB, at: 0)
+    check("in flight: A's request was cancelled", h.lookup.cancelled == [songA.id], "\(h.lookup.cancelled)")
+    check("in flight: trace has cancelled", h.traces.contains { $0.contains("cancelled") })
+    check("in flight: B looked up", waitUntil { h.lookup.requests == [songA.id, songB.id] }, "\(h.lookup.requests)")
+    h.lookup.release(songA.id)  // the late answer for A
+    h.spotify.advance(4.2)
+    check("in flight: only B's line is shown", waitUntil { h.views.allSatisfy { $0.text == "B line 1" } }, h.describeViews())
+}
+
+scenario("playback ends during the debounce") { h in
+    h.lookup.usesCache = false
+    h.lookup.answers[songA.id] = syncedLyrics("A")
+    h.play(songA, at: 0)
+    spin(0.2)
+    h.session.onEnded?()
+    spin(LYRICS_FETCH_DEBOUNCE + 0.2)
+    check("ended: the pending lookup never starts", h.lookup.requests.isEmpty, "\(h.lookup.requests)")
+    check("ended: box empty", h.views.allSatisfy { $0.text == nil && $0.placeholder == nil && !$0.isVisible }, h.describeViews())
+}
+
+scenario("placeholder during the intro, not in mid-song gaps") { h in
+    h.lookup.answers[songA.id] = syncedLyrics("A")  // intro until 4 s, instrumental gap at 20-28 s
+    h.play(songA, at: 0)
+    spin(ONE_TICK)
+    check("intro: placeholder shows the title and artist", h.views.allSatisfy { $0.isVisible && $0.placeholder == "Song aaaa|Lantern Choir" && $0.text == nil }, h.describeViews())
+    h.spotify.advance(2)
+    spin(ONE_TICK)
+    check("intro: still there mid-intro", h.views.allSatisfy { $0.placeholder != nil }, h.describeViews())
+    h.spotify.advance(2)  // 4 s: the first line (lead included)
+    spin(ONE_TICK)
+    check("intro: first real line replaces it", h.views.allSatisfy { $0.text == "A line 1" && $0.placeholder == nil }, h.describeViews())
+    h.spotify.advance(17)  // 21 s: inside the instrumental gap
+    spin(ONE_TICK)
+    check("gap: mid-song gap stays empty, no placeholder", h.views.allSatisfy { $0.text == nil && $0.placeholder == nil }, h.describeViews())
+    h.spotify.advance(8)  // 29 s
+    spin(ONE_TICK)
+    check("gap: lines resume", h.views.allSatisfy { $0.text == "A verse 1" }, h.describeViews())
+    h.seek(to: 1)
+    spin(ONE_TICK)
+    check("intro: a seek back into the intro shows it again", h.views.allSatisfy { $0.placeholder == "Song aaaa|Lantern Choir" }, h.describeViews())
+    check("intro: trace has placeholder, without lyric text",
+          h.traces.contains { $0.contains("placeholder") } && !h.traces.contains { $0.contains(" line ") || $0.contains("verse") })
+}
+
+scenario("placeholder: a leading blank line is still the intro") { h in
+    var lines = [LyricLine(start: 0, end: 6, text: "", words: nil)]
+    lines.append(LyricLine(start: 6, end: 10, text: "B line 1", words: nil))
+    h.lookup.answers[songB.id] = TimedLyrics(lines: lines)
+    h.play(songB, at: 1)
+    spin(ONE_TICK)
+    check("blank lead: placeholder", h.views.allSatisfy { $0.placeholder != nil }, h.describeViews())
+    h.spotify.advance(5)
+    spin(ONE_TICK)
+    check("blank lead: then the line", h.views.allSatisfy { $0.text == "B line 1" && $0.placeholder == nil }, h.describeViews())
+}
+
+scenario("no placeholder for a song without lyrics") { h in
+    h.lookup.usesCache = false  // network answers none after the debounce
+    h.play(songB, at: 0)
+    spin(ONE_TICK)
+    check("none: placeholder while the lookup is pending", h.views.allSatisfy { $0.placeholder != nil }, h.describeViews())
+    check("none: answered none after the debounce", waitUntil { h.lookup.requests == [songB.id] }, "\(h.lookup.requests)")
+    spin(AFTER_FADE)
+    check("none: box hidden, empty", h.views.allSatisfy { !$0.isVisible && $0.text == nil && $0.placeholder == nil }, h.describeViews())
+    h.spotify.advance(10)
+    spin(ONE_TICK)
+    check("none: stays empty", h.views.allSatisfy { !$0.isVisible && $0.placeholder == nil }, h.describeViews())
+}
+
+scenario("placeholder respects the Lyrics tile and pause") { h in
+    h.lookup.usesCache = false
+    h.lookup.answers[songA.id] = syncedLyrics("A")
+    h.settings.isLyricsEnabled = false
+    h.play(songA, at: 0)
+    spin(ONE_TICK)
+    check("tile off: no placeholder visible while pending", h.views.allSatisfy { !$0.isVisible }, h.describeViews())
+    h.settings.isLyricsEnabled = true
+    spin(ONE_TICK)
+    check("tile on: placeholder appears", h.views.allSatisfy { $0.isVisible && $0.placeholder != nil }, h.describeViews())
+    h.pause()
+    spin(ONE_TICK)
+    check("paused: placeholder hidden", h.views.allSatisfy { !$0.isVisible }, h.describeViews())
+    spin(AFTER_FADE)
+    h.resume()
+    spin(ONE_TICK)
+    check("resumed: placeholder back", h.views.allSatisfy { $0.isVisible && $0.placeholder != nil }, h.describeViews())
+}
+
+scenario("placeholder redrawn on rebuilt windows") { h in
+    h.lookup.usesCache = false
+    h.lookup.answers[songA.id] = syncedLyrics("A")
+    h.play(songA, at: 0)
+    spin(ONE_TICK)
+    h.rebuildWindows()
+    spin(ONE_TICK)
+    check("rebuild: new views show the placeholder", h.views.allSatisfy { $0.isVisible && $0.placeholder != nil }, h.describeViews())
 }
 
 suite.removePersistentDomain(forName: suiteName)

@@ -104,6 +104,22 @@ enum LookupOutcome {
     case found(TimedLyrics), none, failed
 }
 
+// One track's lookup chain (get, search, retries). Cancelling stops the running task and the
+// retry timer; callbacks of a cancelled fetch that still arrive are dropped.
+private final class Fetch {
+    private(set) var isCancelled = false
+    var task: URLSessionDataTask?
+    var retryTimer: DispatchWorkItem?
+
+    func cancel() {
+        isCancelled = true
+        task?.cancel()
+        retryTimer?.cancel()
+        task = nil
+        retryTimer = nil
+    }
+}
+
 // Everything is touched on the main queue only, so no locks are needed.
 final class LyricsProvider {
     private let cacheDirectory: URL
@@ -111,6 +127,8 @@ final class LyricsProvider {
     private let now: () -> Date
     private let retryDelays: [TimeInterval]
     private var waiters: [String: [(LookupOutcome) -> Void]] = [:]
+    // The network work behind each track's waiters, so it can be cancelled by track ID
+    private var fetches: [String: Fetch] = [:]
 
     // `now` is injectable so tests can expire the negative cache
     init(cacheDirectory: URL, session: URLSession = .shared, now: @escaping () -> Date = { Date() },
@@ -135,16 +153,34 @@ final class LyricsProvider {
         }
         let key = trackID.trimmingCharacters(in: .whitespacesAndNewlines)
         if key.isEmpty { return completion(.none) }
-        if let entry = readCache(key) {
-            if let lyrics = entry.lyrics { return completion(.found(lyrics)) }
-            if now().timeIntervalSince(entry.fetchedAt) < LYRICS_NEGATIVE_CACHE_TTL { return completion(.none) }
-        }
+        if let cached = cachedLyrics(trackID: key) { return completion(cached) }
         if waiters[key] != nil {
             waiters[key]?.append(completion)
             return
         }
         waiters[key] = [completion]
-        fetchExact(key: key, artist: artist, title: title, album: album, duration: duration)
+        let fetch = Fetch()
+        fetches[key] = fetch
+        fetchExact(key: key, fetch: fetch, artist: artist, title: title, album: album, duration: duration)
+    }
+
+    // A usable cache entry as an outcome (found, or a still-fresh "none"), nil when the
+    // network is needed. Cheap: one small file read, no network, no callbacks.
+    func cachedLyrics(trackID: String) -> LookupOutcome? {
+        let key = trackID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty { return LookupOutcome.none }
+        guard let entry = readCache(key) else { return nil }
+        if let lyrics = entry.lyrics { return .found(lyrics) }
+        return now().timeIntervalSince(entry.fetchedAt) < LYRICS_NEGATIVE_CACHE_TTL ? LookupOutcome.none : nil
+    }
+
+    // Drops the lookup for this track: stops its in-flight URLSessionTask and pending retry
+    // timer, and forgets its waiters without calling them. Nothing is cached (a cancelled
+    // request is not an answer) and no other track is touched.
+    func cancel(trackID: String) {
+        let key = trackID.trimmingCharacters(in: .whitespacesAndNewlines)
+        waiters.removeValue(forKey: key)
+        fetches.removeValue(forKey: key)?.cancel()
     }
 
     // MARK: LRC parsing
@@ -328,21 +364,24 @@ final class LyricsProvider {
 
     // MARK: Lookup chain
 
-    private func fetchExact(key: String, artist: String, title: String, album: String, duration: TimeInterval?) {
+    private func fetchExact(key: String, fetch: Fetch, artist: String, title: String, album: String,
+                            duration: TimeInterval?) {
         var query = [("artist_name", artist), ("track_name", title), ("album_name", album)]
         if let duration { query.append(("duration", String(Int(duration.rounded())))) }
         guard let url = Self.url(path: "get", query: query) else { return finish(key, .failed) }
-        request(url, label: "lyrics get") { [self] result in
+        request(url, label: "lyrics get", fetch: fetch) { [self] result in
             switch result {
             case .ok(let data):
                 switch Self.outcome(fromExact: data, duration: duration) {
                 case .found(let lyrics): finish(key, .found(lyrics))
                 case .instrumental: finish(key, .none)
                 case .needsSearch(let plainFallback):
-                    fetchSearch(key: key, artist: artist, title: title, duration: duration, plainFallback: plainFallback)
+                    fetchSearch(key: key, fetch: fetch, artist: artist, title: title, duration: duration,
+                                plainFallback: plainFallback)
                 case .failed: finish(key, .failed)
                 }
-            case .notFound: fetchSearch(key: key, artist: artist, title: title, duration: duration, plainFallback: nil)
+            case .notFound:
+                fetchSearch(key: key, fetch: fetch, artist: artist, title: title, duration: duration, plainFallback: nil)
             case .failed, .retryable: finish(key, .failed)
             }
         }
@@ -351,12 +390,12 @@ final class LyricsProvider {
     // Reached only after get gave no synced lyrics; a 200 here with nothing usable is the
     // one definitive miss that gets a negative cache entry. Synced lyrics from search beat
     // get's plain text; with neither, the plain text (if any) is used.
-    private func fetchSearch(key: String, artist: String, title: String, duration: TimeInterval?,
+    private func fetchSearch(key: String, fetch: Fetch, artist: String, title: String, duration: TimeInterval?,
                              plainFallback: TimedLyrics?) {
         guard let url = Self.url(path: "search", query: [("track_name", title), ("artist_name", artist)]) else {
             return finish(key, .failed)
         }
-        request(url, label: "lyrics search") { [self] result in
+        request(url, label: "lyrics search", fetch: fetch) { [self] result in
             switch result {
             case .ok(let data):
                 let found = Self.outcome(fromSearch: data, artist: artist, title: title, duration: duration)
@@ -474,6 +513,7 @@ final class LyricsProvider {
     }
 
     private func finish(_ key: String, _ outcome: LookupOutcome) {
+        fetches.removeValue(forKey: key)
         let pending = waiters.removeValue(forKey: key) ?? []
         switch outcome {
         case .found(let lyrics):
@@ -505,33 +545,42 @@ final class LyricsProvider {
 
     // Calls back on the main queue; logs the HTTP status, never bodies
     // Transient failures are retried after each of retryDelays; if all fail the result
-    // is .failed
-    private func request(_ url: URL, label: String, attempt: Int = 0,
+    // is .failed. A cancelled fetch (see cancel(trackID:)) never calls back.
+    private func request(_ url: URL, label: String, fetch: Fetch, attempt: Int = 0,
                          completion: @escaping (HTTPResult) -> Void) {
+        guard !fetch.isCancelled else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = LYRICS_REQUEST_TIMEOUT
         request.setValue(LRCLIB_USER_AGENT, forHTTPHeaderField: "User-Agent")
         // Built here on the main actor and only ever called there; the session's
         // completion (its own queue) interprets the response and hops back with it
         let deliver: @MainActor @Sendable (HTTPResult) -> Void = { [self] result in
+            guard !fetch.isCancelled else { return }
             guard case .retryable = result else { return completion(result) }
             guard attempt < retryDelays.count else { return completion(.failed) }
             NSLog("wallpaper-overlay: \(label) retry \(attempt + 1) in \(retryDelays[attempt])s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + retryDelays[attempt]) { [self] in
-                self.request(url, label: label, attempt: attempt + 1, completion: completion)
+            let timer = DispatchWorkItem { [self] in
+                self.request(url, label: label, fetch: fetch, attempt: attempt + 1, completion: completion)
             }
+            fetch.retryTimer = timer
+            DispatchQueue.main.asyncAfter(deadline: .now() + retryDelays[attempt], execute: timer)
         }
-        session.dataTask(with: request) { data, response, error in
+        let task = session.dataTask(with: request) { data, response, error in
             let result = Self.interpret(data, response, error, label: label)
             DispatchQueue.main.async { deliver(result) }
-        }.resume()
+        }
+        fetch.task = task
+        task.resume()
     }
 
     // Nonisolated: runs on the URLSession delegate queue
     nonisolated private static func interpret(_ data: Data?, _ response: URLResponse?, _ error: Error?,
                                               label: String) -> HTTPResult {
         if let error {
-            NSLog("wallpaper-overlay: \(label) request failed: \(error.localizedDescription)")
+            // Our own cancel(trackID:) lands here too; it is dropped by the cancelled fetch
+            if (error as? URLError)?.code != .cancelled {
+                NSLog("wallpaper-overlay: \(label) request failed: \(error.localizedDescription)")
+            }
             return .retryable
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
