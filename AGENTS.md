@@ -55,7 +55,8 @@ project fits together; `README.md` is the short human version.
 |---|---|---|
 | macOS 26 (Tahoe) or newer | Liquid Glass (`NSGlassEffectView`) and Core Audio process taps by bundle ID | `sw_vers -productVersion` |
 | Swift compiler (Xcode or Command Line Tools) | builds the app | `swiftc --version` (install: `xcode-select --install`) |
-| ffmpeg | converts any video into the wallpaper format | `ffmpeg -version` (install: `brew install ffmpeg`) |
+| ffmpeg | converts any video into the wallpaper format; normalizes mini TV audio | `ffmpeg -version` (install: `brew install ffmpeg`) |
+| yt-dlp (optional) | downloads mini TV videos from YouTube links | `yt-dlp --version` (install: `brew install yt-dlp`) |
 | Spotify desktop app (optional) | music glow, genre colors, lyrics | `ls /Applications/Spotify.app` |
 | Apple silicon or Intel | both work; Metal is required (every Mac on macOS 26 has it) | n/a |
 
@@ -143,7 +144,8 @@ All of these sit **behind** normal app windows, like a real wallpaper:
 | **Video wallpaper** | Seamless loop rendered with Metal, aspect-filled to every display |
 | **Two looks + transitions** | "Glass" (blurred, tinted, iOS-like) or "Original"; switching plays an animated transition: *Storm rewind* (gold clock face, clockwise sweep, upward rain), *World-line shift* (nixie-tube digits and an RGB-split glitch), *Worldline 2* (white mathematical diagrams, perspective zoom, geometric breakup and glitch), or a crossfade |
 | **Name block** | Large serif name, a hairline rule, and the subtitle, anchored to each screen's top-right corner at a fixed margin (not baked into the video) |
-| **Gear + control center** | A glass gear at the end of the subtitle row opens an iOS-style tile grid: Clock, Glass/Original, transition style, Glow, Lyrics, Romaji, and a Low power indicator. Clicking outside closes it. |
+| **Gear + control center** | A glass gear at the end of the subtitle row opens an iOS-style tile grid: Clock, Glass/Original, transition style, Mini TV, TV videos, Glow, Lyrics, Romaji, and a Low power indicator. Clicking outside closes it. |
+| **Mini TV** | Off by default. A draggable retro TV card under the clock (position saved per display) that crossfades between random clips, with a per-TV mute button. The **TV videos** tile opens a glass popup: paste a YouTube link (Enter or ADD) and it downloads (1080p max, H.264 preferred; other codecs are re-encoded), normalizes audio to -14 LUFS / -1 dBTP (two-pass loudnorm, the same target for every clip), checks the result, and adds it live to every TV. Imports run one at a time; extra links queue. Each video in the list has a remove button that asks once; removed files go to the Trash |
 | **Clock card** | Glass stopwatch / countdown timer under the name; it slides out of the way when the control center opens |
 | **Music glow** | While Spotify plays: a soft glow along the bottom edge that pulses with the real beat, colored by the song's genre, with fire sparks launched on the beat at the song's tempo |
 | **Lyrics** | Time-synced lyrics in a small lower-left box with a kinetic "stagger rise" animation and a karaoke sweep in the genre color; optional romaji for Japanese. Songs LRCLIB has only as plain text show with estimated timing: no sweep, slightly dimmer, marked "♪ approximate". While lyrics load and during a song's intro the box shows the title and artist, small and dim; songs with no lyrics keep it empty |
@@ -178,7 +180,12 @@ audio permission again after rebuilding. Re-allow it in System Settings.
 | `main.swift` | `OverlayController`: creates the per-screen windows, wires every subsystem, owns lifecycle (rebuild on display change, visibility, audio-tap suspend) |
 | `Config.swift` | Reads `~/.config/wallpaper-overlay/config.json` (name, subtitle, fonts, nixie number, video path); validates each key on its own, with safe defaults |
 | `Style.swift` | All layout/look constants and window levels; personal values come from `CONFIG` |
-| `Settings.swift` | UserDefaults-backed toggles (clock, glass, transition, glow, lyrics, romaji) with observers |
+| `Settings.swift` | UserDefaults-backed toggles (clock, glass, transition, glow, lyrics, romaji, mini TV) with observers |
+| `MiniTVView.swift` | The retro TV card: AVPlayer crossfades between clips, CRT texture, drag-to-move, per-TV mute; `setVideoURLs` swaps the playlist live |
+| `MiniTVPlaylist.swift` | Immutable playlist value, stored in `mini-tv-playlist.json`; drops unsafe file names; a broken file is kept as `.broken` |
+| `VideoImporter.swift` | YouTube link parsing (only the 11-char id survives; yt-dlp gets a rebuilt canonical URL), tool lookup (PATH plus Homebrew dirs), and the blocking yt-dlp → ffprobe → two-pass loudnorm → check pipeline. Processes get argument arrays, never a shell |
+| `VideoLibrary.swift` | Main-thread owner of the playlist: queues imports on a background queue, removes videos to the Trash, publishes status text |
+| `VideoLibraryPanel.swift` | The TV videos popup. Its `KeyableGlassPanel` is the one overlay window that can become key (so the link field takes typing) and routes ⌘V/⌘C/⌘X/⌘A/⌘Z by hand, since the accessory app has no Edit menu |
 | `TextBlock.swift` | Draws the name, rule and subtitle; leaves room for the gear |
 | `ControlCenter.swift` | Gear-opened glass panel of `TileButton`s; outside-click close |
 | `ClockModel.swift`, `ClockView.swift` | Stopwatch/timer logic (timer limits injected) and the glass card; `GlassButton`, `makeGlassCard` (Liquid Glass with a blur fallback) |
@@ -208,7 +215,8 @@ BACKDROP_LEVEL = desktopWindow + 2         Metal video + glow + sparks (click-th
 TEXT_LEVEL     = desktopWindow + 3         name block, lyrics box (click-through)
 Finder desktop icons                       (desktopIconWindow)
 CLOCK_LEVEL    = desktopIconWindow + 2     gear, clock card (clickable; same band as macOS widgets)
-PANEL_LEVEL    = CLOCK_LEVEL + 1           control center
+CLOCK_LEVEL    (same band)                 mini TV (clickable, draggable)
+PANEL_LEVEL    = CLOCK_LEVEL + 1           control center, TV videos popup
 normal app windows                         (always above everything here)
 ```
 
@@ -254,6 +262,8 @@ LRCLIB, and (if keyed) Spotify/Gemini. Audio never leaves the machine.
 | `~/.config/wallpaper-overlay/Transition.metal` | Shader source, editable live |
 | `~/.config/wallpaper-overlay/genre-cache.json` | Per-track genre cache |
 | `~/.config/wallpaper-overlay/lyrics-cache/` | Per-track synced lyrics (pruned automatically) |
+| `~/.config/wallpaper-overlay/mini-tv-playlist.json` | Mini TV clips: `{"videos":[{"file","title","youtubeID"}]}`; files sit next to it. Hand-edits are fine (restart after) |
+| `~/.config/wallpaper-overlay/*.mp4` (mini TV clips) | Downloaded clips. Personal media: never commit them |
 | `~/Library/Logs/wallpaper-overlay.log` | Log (trimmed automatically) |
 | `~/Library/Preferences/<bundle id>.plist` | Toggle states from the control center |
 
@@ -369,8 +379,10 @@ scripts/run-tests.sh
 Each suite in `Tests/` is a plain assert-style executable (no XCTest
 dependency). They cover the Spotify notification parsing, genre resolution
 (stubbed HTTP), LRC parsing, LRCLIB fallback and retries, the playback clock,
-settings, beat/tempo detection on synthetic audio, housekeeping and the clock
-model. **Network is always stubbed; test lyrics are invented.**
+settings, beat/tempo detection on synthetic audio, housekeeping, the clock
+model, and the mini TV playlist and video import pipeline (a fake process
+runner stands in for yt-dlp and ffmpeg). **Network is always stubbed; test
+lyrics are invented.**
 
 ### 9.3 Verifying visuals without a screenshot
 

@@ -22,6 +22,11 @@ let SHADOW_COLOR = NSColor(srgbRed: 0.04, green: 0.05, blue: 0.12, alpha: 0.6)
 // Clock widget
 let CLOCK_GAP: CGFloat = 26  // between the subtitle and the glass card
 let CLOCK_FADE_DURATION: TimeInterval = 0.25
+// Mini TV: a draggable retro TV card under the clock, playing the videos
+// listed in mini-tv-playlist.json (added from the "TV videos" tile)
+let MINI_TV_SIZE = NSSize(width: 280, height: 198)
+let MINI_TV_GAP: CGFloat = 22
+let MINI_TV_DEFAULT_VIDEOS: [String] = []  // file names in the overlay folder to seed a new playlist with
 
 // Gear button at the end of the subtitle row, and the control center it opens
 let GEAR_SIZE: CGFloat = 30
