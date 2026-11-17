@@ -11,7 +11,10 @@ third-party wallpaper app needed.
 - **Your name and a short description**, crisp at any resolution and anchored
   to every display's corner
 - **A gear button** opening a glass control center: clock, wallpaper look,
-  transition style, glow, lyrics, romaji
+  transition style, mini TV, glow, lyrics, romaji
+- **A mini TV**: a draggable retro TV that plays your own clips. Paste a
+  YouTube link in the **TV videos** popup to add one (1080p max, volume
+  matched to the rest), or remove clips from the same list
 - **Spotify:** the glow pulses with the real beat, colored by the song's genre;
   sparks fly at the song's tempo; lyrics animate in the lower-left (plain-text
   lyrics get estimated timing and an "approximate" marker)
@@ -21,7 +24,8 @@ third-party wallpaper app needed.
 ## Requirements
 
 macOS 26 or newer, Xcode or Command Line Tools (`xcode-select --install`),
-and ffmpeg (`brew install ffmpeg`). Spotify desktop is optional.
+and ffmpeg (`brew install ffmpeg`). Spotify desktop is optional. Adding mini
+TV videos from YouTube also needs yt-dlp (`brew install yt-dlp`).
 
 ## Install
 
@@ -86,6 +90,8 @@ Audio never leaves your Mac. What leaves it, and where:
 - **LRCLIB** (lyrics): artist, title, album and duration, plus a User-Agent header.
 - **Spotify** (genre, only with keys): the track and artist IDs.
 - **Gemini** (genre, only with a key): artist, title and album.
+- **YouTube** (only when you add a mini TV video): yt-dlp fetches the link you
+  pasted. Videos are saved in your config folder and never uploaded.
 - **Every request** reveals your IP address to the service it goes to.
 
 Song names are written to the local log, which is trimmed automatically. Keys

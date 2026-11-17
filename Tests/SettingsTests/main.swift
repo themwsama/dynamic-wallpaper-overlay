@@ -24,6 +24,7 @@ check("default style", s.transitionStyleRaw == DEFAULT_TRANSITION_STYLE_RAW && D
 check("default glow", s.isMusicGlowEnabled == true)
 check("default lyrics", s.isLyricsEnabled == true)
 check("default romaji", s.isRomajiEnabled == false)
+check("default mini TV hidden", s.isMiniTVVisible == false)
 
 s.isClockVisible = false
 s.isEffectsVisible = false
@@ -31,6 +32,7 @@ s.transitionStyleRaw = 3
 s.isMusicGlowEnabled = false
 s.isLyricsEnabled = false
 s.isRomajiEnabled = true
+s.isMiniTVVisible = true
 s = Settings(defaults: d)
 check("persist clock", !s.isClockVisible)
 check("persist effects", !s.isEffectsVisible)
@@ -38,9 +40,10 @@ check("persist style", s.transitionStyleRaw == 3)
 check("persist glow", !s.isMusicGlowEnabled)
 check("persist lyrics", !s.isLyricsEnabled)
 check("persist romaji", s.isRomajiEnabled)
+check("persist mini TV", s.isMiniTVVisible)
 
 check("key names", SettingKey.allCases.map(\.rawValue) ==
-      ["clockVisible", "effectsVisible", "transitionStyle", "musicGlowEnabled", "lyricsEnabled", "romajiEnabled"])
+      ["clockVisible", "effectsVisible", "transitionStyle", "musicGlowEnabled", "lyricsEnabled", "romajiEnabled", "miniTVVisible"])
 check("written under existing key", d.object(forKey: "clockVisible") as? Bool == false
       && d.object(forKey: "transitionStyle") as? Int == 3)
 

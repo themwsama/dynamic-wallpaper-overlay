@@ -7,6 +7,9 @@ Each suite is a standalone assert-style runner (`PASS`/`FAIL` lines, exit 1 on f
 Run them all with `scripts/run-tests.sh` (one PASS/FAIL line per suite; add `-v` or `--verbose` for full output of every suite).
 
 - `AudioAnalyzerTests`: beat/tempo detection on synthetic audio signals.
+- `MiniTVPlaylistTests`: playlist seeding, atomic save/load, broken-file set-aside, unsafe file names, immutable add/remove, URL resolution.
+- `VideoImporterTests`: YouTube link parsing (accepted forms and rejected look-alikes), file naming, loudnorm JSON parsing, tool lookup, the exact yt-dlp/ffmpeg arguments, and the whole import pipeline (codec copy vs re-encode, silent video, duplicates, download failure, failed loudness check) with a fake process runner.
+- `VideoLibraryTests`: `VideoLibrary` with a fake runner and a fake Trash: seeding, rejected links, duplicate guards, a background import reported on main, missing tools and removal.
 - `ClockModelTests`: clock/timer model state and timer minute limits (compiles `ClockModel.swift` alone; limits come through `init`).
 - `ConfigTests`: `config.json` per-key tolerance, validation, video path resolution, the overlay-dir env override and subtitle fitting.
 - `GenreResolverTests`: genre lookup, mapping, caching and fallback order with stubbed network.

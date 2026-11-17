@@ -7,7 +7,7 @@ let DEFAULT_TRANSITION_STYLE_RAW = 1
 // Raw values are the on-disk UserDefaults keys; existing ones must never be renamed
 enum SettingKey: String, CaseIterable {
     case clockVisible, effectsVisible, transitionStyle
-    case musicGlowEnabled, lyricsEnabled, romajiEnabled
+    case musicGlowEnabled, lyricsEnabled, romajiEnabled, miniTVVisible
 }
 
 final class Settings {
@@ -51,6 +51,12 @@ final class Settings {
     var isRomajiEnabled: Bool {
         get { bool(.romajiEnabled, default: false) }
         set { setBool(.romajiEnabled, newValue, default: false) }
+    }
+
+    // Off until turned on, so a fresh install doesn't show an empty TV
+    var isMiniTVVisible: Bool {
+        get { bool(.miniTVVisible, default: false) }
+        set { setBool(.miniTVVisible, newValue, default: false) }
     }
 
     @discardableResult

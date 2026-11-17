@@ -3,7 +3,8 @@
 // top-right corner with a fixed margin, with a glass stopwatch / timer card
 // underneath. A gear at the end of the subtitle row opens the control center,
 // whose tiles toggle the clock, the wallpaper version (with an animated
-// transition), the transition style, the music glow, lyrics and romaji.
+// transition), the transition style, the music glow, lyrics, romaji and a
+// draggable mini TV whose videos are added from YouTube links.
 // The overlay renders the wallpaper video itself (Metal). While music plays,
 // a glow with fire sparks pulses along the bottom edge to its beat, colored
 // by the song's genre.
@@ -18,12 +19,15 @@ final class ClickThroughFocusPanel: NSPanel {
 }
 
 struct ScreenWindows {
+    let screenFrame: NSRect
     let backdrop: NSWindow?
     let text: NSWindow
     let gear: NSWindow
     let gearButton: GlassButton
     let clock: NSWindow
     let clockView: ClockView
+    let miniTV: NSWindow
+    let miniTVView: MiniTVView
     let lyrics: NSWindow
     let lyricsView: LyricsView
     let clockHomeOrigin: NSPoint  // where the clock sits while the control center is closed
@@ -62,6 +66,8 @@ final class OverlayController: NSObject {
         accent: { [weak self] in self?.glow?.accentColor ?? TEXT_COLOR })
     private lazy var controlCenter = ControlCenterPanel(
         tiles: makeTiles(), exemptWindows: { [weak self] in self?.screens.map(\.gear) ?? [] })
+    private lazy var videoLibrary = VideoLibrary(directory: OVERLAY_DIR, seed: MINI_TV_DEFAULT_VIDEOS)
+    private lazy var videoPanel = VideoLibraryPanel(library: videoLibrary)
     // The clock sits where the panel opens, so it slides down out of the way
     private var clockOffset: CGFloat {
         ControlCenterPanel.size(tileCount: makeTiles().count).height + PANEL_GAP
@@ -72,6 +78,13 @@ final class OverlayController: NSObject {
         clock.onChange = { [weak self] in self?.refreshClocks() }
         clock.onFinish = { playFinishSound() }
         controlCenter.onOpenChange = { [weak self] isOpen in self?.controlCenterChanged(isOpen: isOpen) }
+        videoPanel.onOpenChange = { [weak self] isOpen in
+            self?.slideClocks(down: isOpen ? VIDEO_PANEL_SIZE.height + PANEL_GAP : 0)
+        }
+        videoLibrary.onChange = { [weak self] in self?.videoPanel.refresh() }
+        videoLibrary.onPlaylistChange = { [weak self] urls in
+            self?.screens.forEach { $0.miniTVView.setVideoURLs(urls) }
+        }
         settings.observe { [weak self] _ in self?.controlCenter.refresh() }
         NotificationCenter.default.addObserver(
             self, selector: #selector(powerStateChanged),
@@ -107,7 +120,9 @@ final class OverlayController: NSObject {
 
     private func rebuild() {
         controlCenter.close()
-        screens.flatMap { [$0.backdrop, $0.text, $0.gear, $0.clock, $0.lyrics].compactMap { $0 } }
+        videoPanel.close()
+        screens.forEach { $0.miniTVView.setPlaying(false) }  // old TVs would keep playing sound
+        screens.flatMap { [$0.backdrop, $0.text, $0.gear, $0.clock, $0.miniTV, $0.lyrics].compactMap { $0 } }
             .forEach { $0.orderOut(nil) }
         screens = NSScreen.screens.map(makeWindows)
         // New windows start with an unknown occlusion state; check again once they're up
@@ -152,6 +167,12 @@ final class OverlayController: NSObject {
                         title: { [weak self] in self?.transitionStyle.shortName ?? "" },
                         isOn: { true }, isReadOnly: false,
                         action: { [weak self] in self?.cycleTransitionStyle() }),
+            ControlTile(symbol: "tv", glyph: nil, title: { "Mini TV" },
+                        isOn: { s.isMiniTVVisible }, isReadOnly: false,
+                        action: { [weak self] in self?.toggleMiniTV() }),
+            ControlTile(symbol: "plus.rectangle.on.rectangle", glyph: nil, title: { "TV videos" },
+                        isOn: { [weak self] in self?.videoPanel.isOpen ?? false }, isReadOnly: false,
+                        action: { [weak self] in self?.openVideoPanel() }),
             ControlTile(symbol: "sparkles", glyph: nil, title: { "Glow" },
                         isOn: { s.isMusicGlowEnabled }, isReadOnly: false,
                         action: { [weak self] in self?.toggleGlow() }),
@@ -185,6 +206,23 @@ final class OverlayController: NSObject {
         settings.transitionStyleRaw = transitionStyle.next.rawValue
     }
 
+    private func toggleMiniTV() {
+        settings.isMiniTVVisible.toggle()
+        screens.forEach { screen in
+            screen.miniTVView.setPlaying(settings.isMiniTVVisible)
+            if settings.isMiniTVVisible { screen.miniTV.orderFrontRegardless() } else { screen.miniTV.orderOut(nil) }
+        }
+    }
+
+    // Opens on the display under the pointer, where the control center just was
+    private func openVideoPanel() {
+        let mouse = NSEvent.mouseLocation
+        guard let screen = screens.first(where: { NSMouseInRect(mouse, $0.screenFrame, false) }) ?? screens.first
+        else { return }
+        controlCenter.close()
+        videoPanel.open(topRight: screen.panelTopRight)
+    }
+
     private func toggleGlow() {
         settings.isMusicGlowEnabled.toggle()
         glow?.isEnabled = settings.isMusicGlowEnabled
@@ -197,9 +235,13 @@ final class OverlayController: NSObject {
     }
 
     private func controlCenterChanged(isOpen: Bool) {
+        screens.forEach { $0.gearButton.isSelected = isOpen }
+        slideClocks(down: isOpen ? clockOffset : 0)
+    }
+
+    private func slideClocks(down offset: CGFloat) {
         for s in screens {
-            s.gearButton.isSelected = isOpen
-            let origin = NSPoint(x: s.clockHomeOrigin.x, y: s.clockHomeOrigin.y - (isOpen ? clockOffset : 0))
+            let origin = NSPoint(x: s.clockHomeOrigin.x, y: s.clockHomeOrigin.y - offset)
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = PANEL_ANIMATION_DURATION
                 ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1.0)
@@ -255,6 +297,18 @@ final class OverlayController: NSObject {
         let view = ClockView(frame: NSRect(x: 0, y: 0, width: clockWidth, height: CLOCK_HEIGHT), model: clock)
         clockWindow.contentView = makeGlassCard(frame: view.frame, content: view)
 
+        // The TV starts under the clock; once dragged, it reopens where it was left
+        let tvKey = Self.miniTVPositionKey(for: screen)
+        let defaultTVOrigin = NSPoint(x: right - MINI_TV_SIZE.width, y: clockOrigin.y - MINI_TV_GAP - MINI_TV_SIZE.height)
+        let savedX = UserDefaults.standard.object(forKey: "\(tvKey).x") as? CGFloat ?? defaultTVOrigin.x
+        let savedY = UserDefaults.standard.object(forKey: "\(tvKey).y") as? CGFloat ?? defaultTVOrigin.y
+        let tvOrigin = NSPoint(x: min(max(savedX, visible.minX), visible.maxX - MINI_TV_SIZE.width),
+                               y: min(max(savedY, visible.minY), visible.maxY - MINI_TV_SIZE.height))
+        let miniTVWindow = makeWindow(NSRect(origin: tvOrigin, size: MINI_TV_SIZE), level: CLOCK_LEVEL, clickable: true)
+        let miniTVView = MiniTVView(frame: NSRect(origin: .zero, size: MINI_TV_SIZE),
+                                    videoURLs: videoLibrary.videoURLs, positionKey: tvKey)
+        miniTVWindow.contentView = miniTVView
+
         let lyricsFrame = NSRect(origin: NSPoint(x: visible.minX + LYRICS_MARGIN.x, y: visible.minY + LYRICS_MARGIN.y),
                                  size: LYRICS_BOX)
         let lyricsWindow = makeWindow(lyricsFrame, level: TEXT_LEVEL, clickable: false)
@@ -272,9 +326,11 @@ final class OverlayController: NSObject {
         gearWindow.orderFrontRegardless()
         lyricsWindow.orderFrontRegardless()
         if settings.isClockVisible { clockWindow.orderFrontRegardless() }
+        if settings.isMiniTVVisible { miniTVWindow.orderFrontRegardless() } else { miniTVView.setPlaying(false) }
         let windows = ScreenWindows(
-            backdrop: backdrop, text: textWindow, gear: gearWindow, gearButton: gearButton,
-            clock: clockWindow, clockView: view, lyrics: lyricsWindow, lyricsView: lyricsView,
+            screenFrame: screen.frame, backdrop: backdrop, text: textWindow, gear: gearWindow, gearButton: gearButton,
+            clock: clockWindow, clockView: view, miniTV: miniTVWindow, miniTVView: miniTVView,
+            lyrics: lyricsWindow, lyricsView: lyricsView,
             clockHomeOrigin: clockOrigin,
             panelTopRight: NSPoint(x: right, y: rowBottom - PANEL_GAP))
         // Capture only the point, not the windows: holding them here would keep
@@ -282,6 +338,12 @@ final class OverlayController: NSObject {
         let panelTopRight = windows.panelTopRight
         gearButton.action = { [weak self] in self?.controlCenter.toggle(topRight: panelTopRight) }
         return windows
+    }
+
+    // One saved TV position per display
+    private static func miniTVPositionKey(for screen: NSScreen) -> String {
+        let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        return "miniTV.\(displayID?.stringValue ?? screen.localizedName)"
     }
 
     private func makeWindow(_ frame: NSRect, level: NSWindow.Level, clickable: Bool) -> NSWindow {
